@@ -482,7 +482,7 @@ exports.notifySubstitutes = async (req, res, next) => {
     await query(`UPDATE comm_messages SET status=@st WHERE id=@id`,
       { st: { type: sql.VarChar(20), value: finalStatus }, id: { type: sql.UniqueIdentifier, value: msgId } });
 
-    return success(
+       return success(
       res,
       { notified, results, comm_message_id: msgId, status: finalStatus },
       finalStatus === 'sent' ? `Notified ${notified} teacher(s) via app/email/WhatsApp`
