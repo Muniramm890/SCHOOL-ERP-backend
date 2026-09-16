@@ -444,3 +444,32 @@ exports.createAndSend = async (req, res, next) => {
     return created(res, { id: txResult.msgId, status: finalStatus, recipient_count: recipients.length, attachment_count: uploadedAttachments.length });
   } catch (err) { next(err); }
 };
+
+// GET /api/comm/messages/:id/viewers
+exports.getViewers = async (req, res, next) => {
+  try {
+    const { schoolId } = req.user;
+    const { id } = req.params;
+
+    const staffViewers = await query(
+      `SELECT u.full_name AS name, 'staff' AS recipient_type, sn.is_read, sn.created_at
+       FROM comm_recipients r
+       JOIN staff_notifications sn ON sn.related_id = r.message_id AND sn.user_id = r.user_id AND sn.school_id=@sid
+       JOIN users u ON u.id = r.user_id
+       WHERE r.message_id=@id AND r.recipient_type='staff'`,
+      { id: { type: sql.UniqueIdentifier, value: id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
+    );
+
+    const studentViewers = await query(
+      `SELECT (s.first_name + ' ' + s.last_name) AS name, 'student' AS recipient_type, stn.is_read, stn.created_at
+       FROM comm_recipients r
+       JOIN student_notifications stn ON stn.related_id = r.message_id AND stn.student_id = r.student_id AND stn.school_id=@sid
+       JOIN students s ON s.id = r.student_id
+       WHERE r.message_id=@id AND r.recipient_type='student'`,
+      { id: { type: sql.UniqueIdentifier, value: id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
+    );
+
+    const all = [...staffViewers.recordset, ...studentViewers.recordset];
+    return success(res, { total: all.length, seen: all.filter(v => v.is_read).length, viewers: all });
+  } catch (err) { next(err); }
+};
