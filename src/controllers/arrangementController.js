@@ -215,13 +215,19 @@ exports.listHistory = async (req, res, next) => {
 // ══════════════════════════════════════════════════
 exports.notifySubstitutes = async (req, res, next) => {
   try {
-    const { schoolId } = req.user;
+    const { schoolId, userId } = req.user;
     const { date } = req.body;
     if (!date) return badRequest(res, 'date is required (YYYY-MM-DD)');
 
     const school = await queryOne(`SELECT name FROM schools WHERE id=@sid`,
       { sid: { type: sql.UniqueIdentifier, value: schoolId } });
     const schoolName = school?.name || 'Your School';
+
+    const ay = await queryOne(
+      `SELECT id FROM academic_years WHERE school_id=@sid AND is_current=1`,
+      { sid: { type: sql.UniqueIdentifier, value: schoolId } }
+    );
+    if (!ay) return badRequest(res, 'No active academic year found for this school.');
 
     const rows = await query(
       `SELECT sl.substitute_teacher_id, sl.original_teacher_id, ps.period_number, ps.label AS period_label,
@@ -239,9 +245,8 @@ exports.notifySubstitutes = async (req, res, next) => {
       { sid: { type: sql.UniqueIdentifier, value: schoolId }, date: { type: sql.Date, value: date } }
     );
 
-    if (rows.recordset.length === 0) return success(res, { notified: 0 }, 'No substitutions found for this date');
+    if (rows.recordset.length === 0) return success(res, { notified: 0, results: [] }, 'No substitutions found for this date');
 
-    // group rows by substitute teacher
     const byTeacher = new Map();
     for (const r of rows.recordset) {
       if (!byTeacher.has(r.substitute_teacher_id)) byTeacher.set(r.substitute_teacher_id, []);
@@ -250,32 +255,135 @@ exports.notifySubstitutes = async (req, res, next) => {
 
     const dateStr = new Date(date + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' });
 
+    const existingBatch = await queryOne(
+      `SELECT TOP 1 comm_message_id FROM substitution_logs
+       WHERE school_id=@sid AND substitution_date=@date AND comm_message_id IS NOT NULL AND deleted_at IS NULL`,
+      { sid: { type: sql.UniqueIdentifier, value: schoolId }, date: { type: sql.Date, value: date } }
+    );
+
+    let msgId = existingBatch?.comm_message_id;
+    if (!msgId) {
+      msgId = uuidv4();
+      await query(
+        `INSERT INTO comm_messages (id, school_id, academic_year_id, title, body, category, source_module, source_id, status, created_by, created_at)
+         VALUES (@id, @sid, @ay, @title, @body, 'substitution', 'substitution', NULL, 'pending', @by, @now)`,
+        {
+          id: { type: sql.UniqueIdentifier, value: msgId },
+          sid: { type: sql.UniqueIdentifier, value: schoolId },
+          ay: { type: sql.UniqueIdentifier, value: ay.id },
+          title: { type: sql.NVarChar(200), value: `Substitution Duty — ${dateStr}` },
+          body: { type: sql.NVarChar(sql.MAX), value: `Substitution duty assignments for ${dateStr}` },
+          by: { type: sql.UniqueIdentifier, value: userId },
+          now: { type: sql.DateTime2, value: new Date() },
+        }
+      );
+      for (const ch of ['app', 'email', 'whatsapp']) {
+        await query(
+          `INSERT INTO comm_message_channels (school_id, message_id, channel) VALUES (@sid, @mid, @ch)`,
+          { sid: { type: sql.UniqueIdentifier, value: schoolId }, mid: { type: sql.UniqueIdentifier, value: msgId }, ch: { type: sql.VarChar(20), value: ch } }
+        );
+      }
+    }
+
     let notified = 0;
+    let anySentOverall = false, anyFailedOverall = false;
+    const results = [];
+
     for (const [teacherId, entries] of byTeacher) {
       const teacherName = entries[0].sub_name;
       const arrangementLines = entries
         .map((e) => `📍 P${e.period_number}: Class ${e.class_name}-${e.section_name} (Repl. ${e.original_teacher_name})`)
         .join('\n');
 
-      // 1) IN-APP — reuses same table CommHub already writes to. Wrapped so a failure here
-      // can never block email/WhatsApp for THIS teacher or stop the loop for the NEXT teacher.
-      try {
+      const existingRecipient = await queryOne(
+        `SELECT id FROM comm_recipients WHERE message_id=@mid AND user_id=@uid`,
+        { mid: { type: sql.UniqueIdentifier, value: msgId }, uid: { type: sql.UniqueIdentifier, value: teacherId } }
+      );
+      let recipientId = existingRecipient?.id;
+      if (!recipientId) {
+        recipientId = uuidv4();
         await query(
-          `INSERT INTO staff_notifications (school_id, user_id, type, title, message)
-           VALUES (@sid, @uid, 'substitution', @title, @msg)`,
+          `INSERT INTO comm_recipients (id, school_id, message_id, recipient_type, student_id, user_id, created_at)
+           VALUES (@id, @sid, @mid, 'staff', NULL, @uid, @now)`,
           {
+            id: { type: sql.UniqueIdentifier, value: recipientId },
             sid: { type: sql.UniqueIdentifier, value: schoolId },
+            mid: { type: sql.UniqueIdentifier, value: msgId },
             uid: { type: sql.UniqueIdentifier, value: teacherId },
-            title: { type: sql.NVarChar(200), value: `Substitution Duty — ${dateStr}` },
-            msg: { type: sql.NVarChar(500), value: arrangementLines.slice(0, 500) },
+            now: { type: sql.DateTime2, value: new Date() },
           }
         );
-      } catch (e) {
-        console.error('In-app substitution notify failed for teacher', teacherId, ':', e.message);
       }
 
-      // 2) EMAIL — attractive banner (inline SVG→base64, dynamic school name) + arrangement list
-      if (entries[0].sub_email) {
+      const priorDeliveries = await query(
+        `SELECT channel, status FROM comm_deliveries WHERE recipient_id=@rid`,
+        { rid: { type: sql.UniqueIdentifier, value: recipientId } }
+      );
+      const alreadySent = new Set(priorDeliveries.recordset.filter((d) => d.status === 'sent').map((d) => d.channel));
+
+      const teacherResult = { teacher_id: teacherId, teacher_name: teacherName, app: null, email: null, whatsapp: null, overall: null };
+      let anySentForTeacher = false, anyFailedForTeacher = false;
+
+      const recordDelivery = async (channel, status, errorMsg) => {
+        const existingDelivery = await queryOne(
+          `SELECT id FROM comm_deliveries WHERE recipient_id=@rid AND channel=@ch`,
+          { rid: { type: sql.UniqueIdentifier, value: recipientId }, ch: { type: sql.VarChar(20), value: channel } }
+        );
+        if (existingDelivery) {
+          await query(
+            `UPDATE comm_deliveries SET status=@status, error_message=@err,
+               sent_at=CASE WHEN @status='sent' THEN GETUTCDATE() ELSE sent_at END
+             WHERE id=@id`,
+            {
+              id: { type: sql.UniqueIdentifier, value: existingDelivery.id },
+              status: { type: sql.VarChar(20), value: status },
+              err: { type: sql.NVarChar(500), value: errorMsg ? String(errorMsg).slice(0, 500) : null },
+            }
+          );
+        } else {
+          await query(
+            `INSERT INTO comm_deliveries (school_id, recipient_id, channel, status, error_message, sent_at)
+             VALUES (@sid, @rid, @ch, @status, @err, CASE WHEN @status='sent' THEN GETUTCDATE() ELSE NULL END)`,
+            {
+              sid: { type: sql.UniqueIdentifier, value: schoolId },
+              rid: { type: sql.UniqueIdentifier, value: recipientId },
+              ch: { type: sql.VarChar(20), value: channel },
+              status: { type: sql.VarChar(20), value: status },
+              err: { type: sql.NVarChar(500), value: errorMsg ? String(errorMsg).slice(0, 500) : null },
+            }
+          );
+        }
+        teacherResult[channel] = { status, error: errorMsg || null };
+        if (status === 'sent') anySentForTeacher = true; else anyFailedForTeacher = true;
+      };
+
+      if (alreadySent.has('app')) {
+        teacherResult.app = { status: 'sent', error: null };
+        anySentForTeacher = true;
+      } else {
+        try {
+          await query(
+            `INSERT INTO staff_notifications (school_id, user_id, type, title, message, related_id)
+             VALUES (@sid, @uid, 'substitution', @title, @msg, @relId)`,
+            {
+              sid: { type: sql.UniqueIdentifier, value: schoolId },
+              uid: { type: sql.UniqueIdentifier, value: teacherId },
+              title: { type: sql.NVarChar(200), value: `Substitution Duty — ${dateStr}` },
+              msg: { type: sql.NVarChar(500), value: arrangementLines.slice(0, 500) },
+              relId: { type: sql.UniqueIdentifier, value: msgId },
+            }
+          );
+          await recordDelivery('app', 'sent', null);
+        } catch (e) {
+          console.error('In-app substitution notify failed for teacher', teacherId, ':', e.message);
+          await recordDelivery('app', 'failed', e.message);
+        }
+      }
+
+      if (alreadySent.has('email')) {
+        teacherResult.email = { status: 'sent', error: null };
+        anySentForTeacher = true;
+      } else if (entries[0].sub_email) {
         try {
           const bannerSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="120">
             <rect width="600" height="120" fill="#1d4ed8"/>
@@ -295,25 +403,74 @@ exports.notifySubstitutes = async (req, res, next) => {
             to: entries[0].sub_email, from: process.env.SG_FROM_EMAIL,
             fromName: schoolName, subject: `Substitution Duty — ${dateStr}`, html,
           });
-        } catch (e) { console.error('Substitution email failed:', e.message); }
+          await recordDelivery('email', 'sent', null);
+        } catch (e) {
+          console.error('Substitution email failed:', e.message);
+          await recordDelivery('email', 'failed', e.message);
+        }
+      } else {
+        await recordDelivery('email', 'failed', 'No email on file for this teacher');
       }
 
-      // 3) WHATSAPP — template: substitution_assignment_alert (4 body vars)
-      if (entries[0].sub_phone) {
+      if (alreadySent.has('whatsapp')) {
+        teacherResult.whatsapp = { status: 'sent', error: null };
+        anySentForTeacher = true;
+      } else if (entries[0].sub_phone) {
         try {
           const components = [{
             type: 'body',
             parameters: [
-              { type: 'text', text: teacherName },        // {{1}} faculty name
-              { type: 'text', text: dateStr },             // {{2}} date
-              { type: 'text', text: arrangementLines },    // {{3}} full day's arrangement
-              { type: 'text', text: schoolName },          // {{4}} school name (SaaS dynamic)
+              { type: 'text', text: teacherName },
+              { type: 'text', text: dateStr },
+              { type: 'text', text: arrangementLines },
+              { type: 'text', text: schoolName },
             ],
           }];
           await sendTemplate(entries[0].sub_phone, 'substitution_assignment_alert', 'en', components);
-        } catch (e) { console.error('Substitution WhatsApp failed:', e.message); }
+          await recordDelivery('whatsapp', 'sent', null);
+        } catch (e) {
+          console.error('Substitution WhatsApp failed:', e.message);
+          await recordDelivery('whatsapp', 'failed', e.message);
+        }
+      } else {
+        await recordDelivery('whatsapp', 'failed', 'No phone number on file for this teacher');
       }
 
+      const teacherStatus = anySentForTeacher && anyFailedForTeacher ? 'partial' : anySentForTeacher ? 'sent' : 'failed';
+      teacherResult.overall = teacherStatus;
+      results.push(teacherResult);
+      if (anySentForTeacher) anySentOverall = true;
+      if (anyFailedForTeacher) anyFailedOverall = true;
+
+      await query(
+        `UPDATE substitution_logs SET notified_at=@now, notify_status=@st, comm_message_id=@mid
+         WHERE school_id=@sid AND substitution_date=@date AND substitute_teacher_id=@tid AND deleted_at IS NULL`,
+        {
+          now: { type: sql.DateTime2, value: new Date() },
+          st: { type: sql.VarChar(10), value: teacherStatus },
+          mid: { type: sql.UniqueIdentifier, value: msgId },
+          sid: { type: sql.UniqueIdentifier, value: schoolId },
+          date: { type: sql.Date, value: date },
+          tid: { type: sql.UniqueIdentifier, value: teacherId },
+        }
+      );
+
+      notified++;
+    }
+
+    const finalStatus = anyFailedOverall && anySentOverall ? 'partial' : anyFailedOverall ? 'failed' : 'sent';
+    await query(`UPDATE comm_messages SET status=@st WHERE id=@id`,
+      { st: { type: sql.VarChar(20), value: finalStatus }, id: { type: sql.UniqueIdentifier, value: msgId } });
+
+    return success(
+      res,
+      { notified, results, comm_message_id: msgId, status: finalStatus },
+      finalStatus === 'sent' ? `Notified ${notified} teacher(s) via app/email/WhatsApp`
+        : finalStatus === 'partial' ? `Notified ${notified} teacher(s), but some channels failed — see details`
+        : `Notify failed on all channels — see details`
+    );
+  } catch (err) { next(err); }
+};
       notified++;
     }
 
