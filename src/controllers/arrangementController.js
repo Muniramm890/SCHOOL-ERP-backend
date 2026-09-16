@@ -2,6 +2,8 @@
 const { query, queryOne, sql } = require('../config/db');
 const { success, created, notFound, badRequest } = require('../utils/response');
 const { v4: uuidv4 } = require('uuid');
+const { sendHtmlEmail } = require('../services/emailService');
+const { sendTemplate } = require('../services/whatsappService');
 
 async function assertStaffBelongsToSchool(schoolId, staffId) {
   const row = await queryOne(
@@ -81,6 +83,7 @@ exports.confirmArrangement = async (req, res, next) => {
     if (!date || !Array.isArray(entries) || entries.length === 0) return badRequest(res, 'date and entries[] are required.');
 
     let savedCount = 0;
+    const changedByTeacher = new Map();
     for (const e of entries) {
       if (!(await assertStaffBelongsToSchool(schoolId, e.substitute_teacher_id))) continue; // SaaS safety
 
@@ -100,10 +103,13 @@ exports.confirmArrangement = async (req, res, next) => {
         by: { type: sql.UniqueIdentifier, value: userId }, now: { type: sql.DateTime2, value: new Date() },
       };
 
+     let substituteChanged = false;
       if (existing) {
+        substituteChanged = existing.substitute_teacher_id !== e.substitute_teacher_id;
         await query(`UPDATE substitution_logs SET substitute_teacher_id=@sub, is_suggested_match=@suggested WHERE id=@id`,
           { ...p, id: { type: sql.UniqueIdentifier, value: existing.id } });
       } else {
+        substituteChanged = true; // brand new assignment
         await query(
           `INSERT INTO substitution_logs (id, school_id, substitution_date, period_slot_id, section_id, subject_id,
              original_teacher_id, substitute_teacher_id, original_status, is_suggested_match, created_by, created_at)
@@ -111,9 +117,49 @@ exports.confirmArrangement = async (req, res, next) => {
           { ...p, id: { type: sql.UniqueIdentifier, value: uuidv4() } });
       }
       savedCount++;
+
+      // fire an in-app-only notification whenever a teacher is freshly assigned/changed —
+      // email + WhatsApp still go only via the explicit "Notify" button (notifySubstitutes)
+      if (substituteChanged) {
+        if (!changedByTeacher.has(e.substitute_teacher_id)) changedByTeacher.set(e.substitute_teacher_id, []);
+        changedByTeacher.get(e.substitute_teacher_id).push(e);
+      }
     }
 
-    return success(res, { saved: savedCount }, 'Arrangement confirmed successfully');
+    // consolidate: one in-app row per teacher, covering every newly-assigned period in this save
+    for (const [teacherId, changedEntries] of changedByTeacher) {
+      const lines = [];
+      for (const e of changedEntries) {
+        const row = await queryOne(
+          `SELECT ps.period_number, g.name AS class_name, sec.name AS section_name, uo.full_name AS original_teacher_name
+           FROM period_slots ps
+           JOIN sections sec ON sec.id=@sec
+           JOIN grades g ON g.id = sec.grade_id
+           JOIN users uo ON uo.id=@orig
+           WHERE ps.id=@ps`,
+          {
+            ps: { type: sql.UniqueIdentifier, value: e.period_slot_id },
+            sec: { type: sql.UniqueIdentifier, value: e.section_id },
+            orig: { type: sql.UniqueIdentifier, value: e.original_teacher_id },
+          }
+        );
+        if (row) lines.push(`📍 P${row.period_number}: Class ${row.class_name}-${row.section_name} (Repl. ${row.original_teacher_name})`);
+      }
+      const dateStr = new Date(date + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' });
+
+      await query(
+        `INSERT INTO staff_notifications (school_id, user_id, type, title, message, related_id)
+         VALUES (@sid, @uid, 'substitution', @title, @msg, NULL)`,
+        {
+          sid: { type: sql.UniqueIdentifier, value: schoolId },
+          uid: { type: sql.UniqueIdentifier, value: teacherId },
+          title: { type: sql.NVarChar(200), value: `Substitution Duty — ${dateStr}` },
+          msg: { type: sql.NVarChar(500), value: lines.join('\n').slice(0, 500) },
+        }
+      );
+    }
+
+    return success(res, { saved: savedCount, notified_in_app: changedByTeacher.size }, 'Arrangement confirmed successfully');
   } catch (err) { next(err); }
 };
 
@@ -159,16 +205,111 @@ exports.listHistory = async (req, res, next) => {
 };
 
 // ══════════════════════════════════════════════════
-// NOTIFY (stub — wired later to email/WhatsApp)
+// NOTIFY — groups today's substitution_logs by substitute teacher,
+// fires ONE consolidated message per teacher across app + email + WhatsApp.
 // ══════════════════════════════════════════════════
 exports.notifySubstitutes = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
     const { date } = req.body;
-    // TODO: fetch confirmed entries for `date`, send email/WhatsApp per substitute teacher
-    // with exact period time, section, subject, room_no. Placeholder for now.
+    if (!date) return badRequest(res, 'date is required (YYYY-MM-DD)');
+
+    const school = await queryOne(`SELECT name FROM schools WHERE id=@sid`,
+      { sid: { type: sql.UniqueIdentifier, value: schoolId } });
+    const schoolName = school?.name || 'Your School';
+
+    const rows = await query(
+      `SELECT sl.substitute_teacher_id, sl.original_teacher_id, ps.period_number, ps.label AS period_label,
+              g.name AS class_name, sec.name AS section_name,
+              uo.full_name AS original_teacher_name,
+              us.full_name AS sub_name, us.email AS sub_email, us.phone AS sub_phone
+       FROM substitution_logs sl
+       JOIN period_slots ps ON ps.id = sl.period_slot_id
+       JOIN sections sec    ON sec.id = sl.section_id
+       JOIN grades g        ON g.id = sec.grade_id
+       JOIN users uo        ON uo.id = sl.original_teacher_id
+       JOIN users us        ON us.id = sl.substitute_teacher_id
+       WHERE sl.school_id=@sid AND sl.substitution_date=@date AND sl.deleted_at IS NULL
+       ORDER BY sl.substitute_teacher_id, ps.period_number`,
+      { sid: { type: sql.UniqueIdentifier, value: schoolId }, date: { type: sql.Date, value: date } }
+    );
+
+    if (rows.recordset.length === 0) return success(res, { notified: 0 }, 'No substitutions found for this date');
+
+    // group rows by substitute teacher
+    const byTeacher = new Map();
+    for (const r of rows.recordset) {
+      if (!byTeacher.has(r.substitute_teacher_id)) byTeacher.set(r.substitute_teacher_id, []);
+      byTeacher.get(r.substitute_teacher_id).push(r);
+    }
+
+    const dateStr = new Date(date + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' });
+
+    let notified = 0;
+    for (const [teacherId, entries] of byTeacher) {
+      const teacherName = entries[0].sub_name;
+      const arrangementLines = entries
+        .map((e) => `📍 P${e.period_number}: Class ${e.class_name}-${e.section_name} (Repl. ${e.original_teacher_name})`)
+        .join('\n');
+
+      // 1) IN-APP — reuses same table CommHub already writes to
+      await query(
+        `INSERT INTO staff_notifications (school_id, user_id, type, title, message, related_id)
+         VALUES (@sid, @uid, 'substitution', @title, @msg, NULL)`,
+        {
+          sid: { type: sql.UniqueIdentifier, value: schoolId },
+          uid: { type: sql.UniqueIdentifier, value: teacherId },
+          title: { type: sql.NVarChar(200), value: `Substitution Duty — ${dateStr}` },
+          msg: { type: sql.NVarChar(500), value: arrangementLines.slice(0, 500) },
+        }
+      );
+
+      // 2) EMAIL — attractive banner (inline SVG→base64, dynamic school name) + arrangement list
+      if (entries[0].sub_email) {
+        try {
+          const bannerSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="120">
+            <rect width="600" height="120" fill="#1d4ed8"/>
+            <text x="30" y="50" font-family="Arial" font-size="22" fill="#ffffff" font-weight="bold">${schoolName}</text>
+            <text x="30" y="85" font-family="Arial" font-size="15" fill="#dbeafe">Substitution Duty Alert</text>
+          </svg>`;
+          const bannerBase64 = `data:image/svg+xml;base64,${Buffer.from(bannerSvg).toString('base64')}`;
+          const html = `
+            <img src="${bannerBase64}" style="width:100%;max-width:600px;border-radius:8px 8px 0 0;" />
+            <div style="padding:20px;font-family:Arial,sans-serif;">
+              <p>Dear ${teacherName},</p>
+              <p>You have been assigned substitution duty on <strong>${dateStr}</strong>:</p>
+              <pre style="font-family:Arial,sans-serif;font-size:14px;white-space:pre-line;">${arrangementLines}</pre>
+              <p style="color:#6b7280;font-size:12px;">— ${schoolName}</p>
+            </div>`;
+          await sendHtmlEmail({
+            to: entries[0].sub_email, from: process.env.SG_FROM_EMAIL,
+            fromName: schoolName, subject: `Substitution Duty — ${dateStr}`, html,
+          });
+        } catch (e) { console.error('Substitution email failed:', e.message); }
+      }
+
+      // 3) WHATSAPP — template: substitution_assignment_alert (4 body vars)
+      if (entries[0].sub_phone) {
+        try {
+          const components = [{
+            type: 'body',
+            parameters: [
+              { type: 'text', text: teacherName },        // {{1}} faculty name
+              { type: 'text', text: dateStr },             // {{2}} date
+              { type: 'text', text: arrangementLines },    // {{3}} full day's arrangement
+              { type: 'text', text: schoolName },          // {{4}} school name (SaaS dynamic)
+            ],
+          }];
+          await sendTemplate(entries[0].sub_phone, 'substitution_assignment_alert', 'en', components);
+        } catch (e) { console.error('Substitution WhatsApp failed:', e.message); }
+      }
+
+      notified++;
+    }
+
     await query(`UPDATE substitution_logs SET notified_at=@now WHERE school_id=@sid AND substitution_date=@date AND deleted_at IS NULL`,
       { sid: { type: sql.UniqueIdentifier, value: schoolId }, date: { type: sql.Date, value: date }, now: { type: sql.DateTime2, value: new Date() } });
-    return success(res, null, 'Notifications marked as sent (channel integration pending)');
+
+    return success(res, { notified }, `Notified ${notified} teacher(s) via app/email/WhatsApp`);
   } catch (err) { next(err); }
 };
