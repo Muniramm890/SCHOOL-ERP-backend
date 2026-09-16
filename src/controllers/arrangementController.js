@@ -147,16 +147,21 @@ exports.confirmArrangement = async (req, res, next) => {
       }
       const dateStr = new Date(date + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' });
 
-      await query(
-        `INSERT INTO staff_notifications (school_id, user_id, type, title, message, related_id)
-         VALUES (@sid, @uid, 'substitution', @title, @msg, NULL)`,
-        {
-          sid: { type: sql.UniqueIdentifier, value: schoolId },
-          uid: { type: sql.UniqueIdentifier, value: teacherId },
-          title: { type: sql.NVarChar(200), value: `Substitution Duty — ${dateStr}` },
-          msg: { type: sql.NVarChar(500), value: lines.join('\n').slice(0, 500) },
-        }
-      );
+      try {
+        await query(
+          `INSERT INTO staff_notifications (school_id, user_id, type, title, message)
+           VALUES (@sid, @uid, 'substitution', @title, @msg)`,
+          {
+            sid: { type: sql.UniqueIdentifier, value: schoolId },
+            uid: { type: sql.UniqueIdentifier, value: teacherId },
+            title: { type: sql.NVarChar(200), value: `Substitution Duty — ${dateStr}` },
+            msg: { type: sql.NVarChar(500), value: lines.join('\n').slice(0, 500) },
+          }
+        );
+      } catch (e) {
+        // Never let an in-app notify failure take down the whole save — substitution_logs already committed above.
+        console.error('In-app substitution notify failed for teacher', teacherId, ':', e.message);
+      }
     }
 
     return success(res, { saved: savedCount, notified_in_app: changedByTeacher.size }, 'Arrangement confirmed successfully');
@@ -252,17 +257,22 @@ exports.notifySubstitutes = async (req, res, next) => {
         .map((e) => `📍 P${e.period_number}: Class ${e.class_name}-${e.section_name} (Repl. ${e.original_teacher_name})`)
         .join('\n');
 
-      // 1) IN-APP — reuses same table CommHub already writes to
-      await query(
-        `INSERT INTO staff_notifications (school_id, user_id, type, title, message, related_id)
-         VALUES (@sid, @uid, 'substitution', @title, @msg, NULL)`,
-        {
-          sid: { type: sql.UniqueIdentifier, value: schoolId },
-          uid: { type: sql.UniqueIdentifier, value: teacherId },
-          title: { type: sql.NVarChar(200), value: `Substitution Duty — ${dateStr}` },
-          msg: { type: sql.NVarChar(500), value: arrangementLines.slice(0, 500) },
-        }
-      );
+      // 1) IN-APP — reuses same table CommHub already writes to. Wrapped so a failure here
+      // can never block email/WhatsApp for THIS teacher or stop the loop for the NEXT teacher.
+      try {
+        await query(
+          `INSERT INTO staff_notifications (school_id, user_id, type, title, message)
+           VALUES (@sid, @uid, 'substitution', @title, @msg)`,
+          {
+            sid: { type: sql.UniqueIdentifier, value: schoolId },
+            uid: { type: sql.UniqueIdentifier, value: teacherId },
+            title: { type: sql.NVarChar(200), value: `Substitution Duty — ${dateStr}` },
+            msg: { type: sql.NVarChar(500), value: arrangementLines.slice(0, 500) },
+          }
+        );
+      } catch (e) {
+        console.error('In-app substitution notify failed for teacher', teacherId, ':', e.message);
+      }
 
       // 2) EMAIL — attractive banner (inline SVG→base64, dynamic school name) + arrangement list
       if (entries[0].sub_email) {
