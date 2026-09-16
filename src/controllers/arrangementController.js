@@ -210,8 +210,13 @@ exports.listHistory = async (req, res, next) => {
 };
 
 // ══════════════════════════════════════════════════
-// NOTIFY — groups today's substitution_logs by substitute teacher,
-// fires ONE consolidated message per teacher across app + email + WhatsApp.
+// NOTIFY — groups today's substitution_logs by substitute teacher and fires ONE
+// consolidated message per teacher across app + email + WhatsApp.
+//
+// Routed through the SAME comm_messages / comm_recipients / comm_deliveries
+// pipeline CommHub uses, so this batch shows up in CommHub history too and
+// every channel's REAL outcome (sent/failed + error) is recorded — not assumed.
+// notified_at / notify_status are only ever set to what actually happened.
 // ══════════════════════════════════════════════════
 exports.notifySubstitutes = async (req, res, next) => {
   try {
@@ -247,6 +252,7 @@ exports.notifySubstitutes = async (req, res, next) => {
 
     if (rows.recordset.length === 0) return success(res, { notified: 0, results: [] }, 'No substitutions found for this date');
 
+    // group rows by substitute teacher
     const byTeacher = new Map();
     for (const r of rows.recordset) {
       if (!byTeacher.has(r.substitute_teacher_id)) byTeacher.set(r.substitute_teacher_id, []);
@@ -255,6 +261,8 @@ exports.notifySubstitutes = async (req, res, next) => {
 
     const dateStr = new Date(date + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' });
 
+    // ── Reuse this date's batch message if a prior notify attempt already created one
+    // (retry-safe: prevents duplicate comm_messages every time "Notify" is clicked again) ──
     const existingBatch = await queryOne(
       `SELECT TOP 1 comm_message_id FROM substitution_logs
        WHERE school_id=@sid AND substitution_date=@date AND comm_message_id IS NOT NULL AND deleted_at IS NULL`,
@@ -287,7 +295,7 @@ exports.notifySubstitutes = async (req, res, next) => {
 
     let notified = 0;
     let anySentOverall = false, anyFailedOverall = false;
-    const results = [];
+    const results = []; // ← returned to frontend so real per-teacher/channel errors are visible
 
     for (const [teacherId, entries] of byTeacher) {
       const teacherName = entries[0].sub_name;
@@ -295,6 +303,7 @@ exports.notifySubstitutes = async (req, res, next) => {
         .map((e) => `📍 P${e.period_number}: Class ${e.class_name}-${e.section_name} (Repl. ${e.original_teacher_name})`)
         .join('\n');
 
+      // reuse existing recipient row for this teacher on retry — don't duplicate
       const existingRecipient = await queryOne(
         `SELECT id FROM comm_recipients WHERE message_id=@mid AND user_id=@uid`,
         { mid: { type: sql.UniqueIdentifier, value: msgId }, uid: { type: sql.UniqueIdentifier, value: teacherId } }
@@ -315,6 +324,8 @@ exports.notifySubstitutes = async (req, res, next) => {
         );
       }
 
+      // channels already SENT successfully in a prior attempt — skip re-sending these,
+      // only retry channels that are missing or previously failed
       const priorDeliveries = await query(
         `SELECT channel, status FROM comm_deliveries WHERE recipient_id=@rid`,
         { rid: { type: sql.UniqueIdentifier, value: recipientId } }
@@ -324,6 +335,8 @@ exports.notifySubstitutes = async (req, res, next) => {
       const teacherResult = { teacher_id: teacherId, teacher_name: teacherName, app: null, email: null, whatsapp: null, overall: null };
       let anySentForTeacher = false, anyFailedForTeacher = false;
 
+      // upsert: UPDATE an existing delivery row for this (recipient, channel) on retry,
+      // INSERT only the first time — avoids duplicate delivery rows piling up
       const recordDelivery = async (channel, status, errorMsg) => {
         const existingDelivery = await queryOne(
           `SELECT id FROM comm_deliveries WHERE recipient_id=@rid AND channel=@ch`,
@@ -357,6 +370,8 @@ exports.notifySubstitutes = async (req, res, next) => {
         if (status === 'sent') anySentForTeacher = true; else anyFailedForTeacher = true;
       };
 
+      // 1) IN-APP — same staff_notifications table CommHub writes to, now WITH related_id
+      // so it's actually linked back to comm_messages/comm_recipients (was missing before).
       if (alreadySent.has('app')) {
         teacherResult.app = { status: 'sent', error: null };
         anySentForTeacher = true;
@@ -380,6 +395,7 @@ exports.notifySubstitutes = async (req, res, next) => {
         }
       }
 
+      // 2) EMAIL — attractive banner (inline SVG→base64, dynamic school name) + arrangement list
       if (alreadySent.has('email')) {
         teacherResult.email = { status: 'sent', error: null };
         anySentForTeacher = true;
@@ -412,6 +428,7 @@ exports.notifySubstitutes = async (req, res, next) => {
         await recordDelivery('email', 'failed', 'No email on file for this teacher');
       }
 
+      // 3) WHATSAPP — template: substitution_assignment_alert (4 body vars)
       if (alreadySent.has('whatsapp')) {
         teacherResult.whatsapp = { status: 'sent', error: null };
         anySentForTeacher = true;
@@ -420,10 +437,10 @@ exports.notifySubstitutes = async (req, res, next) => {
           const components = [{
             type: 'body',
             parameters: [
-              { type: 'text', text: teacherName },
-              { type: 'text', text: dateStr },
-              { type: 'text', text: arrangementLines },
-              { type: 'text', text: schoolName },
+              { type: 'text', text: teacherName },        // {{1}} faculty name
+              { type: 'text', text: dateStr },             // {{2}} date
+              { type: 'text', text: arrangementLines },    // {{3}} full day's arrangement
+              { type: 'text', text: schoolName },          // {{4}} school name (SaaS dynamic)
             ],
           }];
           await sendTemplate(entries[0].sub_phone, 'substitution_assignment_alert', 'en', components);
@@ -436,12 +453,15 @@ exports.notifySubstitutes = async (req, res, next) => {
         await recordDelivery('whatsapp', 'failed', 'No phone number on file for this teacher');
       }
 
+      // ── REAL outcome for this teacher — drives notified_at/notify_status below ──
       const teacherStatus = anySentForTeacher && anyFailedForTeacher ? 'partial' : anySentForTeacher ? 'sent' : 'failed';
       teacherResult.overall = teacherStatus;
       results.push(teacherResult);
       if (anySentForTeacher) anySentOverall = true;
       if (anyFailedForTeacher) anyFailedOverall = true;
 
+      // notified_at/notify_status now reflect what ACTUALLY happened for this teacher,
+      // not a blanket "sent" regardless of channel failures.
       await query(
         `UPDATE substitution_logs SET notified_at=@now, notify_status=@st, comm_message_id=@mid
          WHERE school_id=@sid AND substitution_date=@date AND substitute_teacher_id=@tid AND deleted_at IS NULL`,
@@ -469,14 +489,5 @@ exports.notifySubstitutes = async (req, res, next) => {
         : finalStatus === 'partial' ? `Notified ${notified} teacher(s), but some channels failed — see details`
         : `Notify failed on all channels — see details`
     );
-  } catch (err) { next(err); }
-};
-      notified++;
-    }
-
-    await query(`UPDATE substitution_logs SET notified_at=@now WHERE school_id=@sid AND substitution_date=@date AND deleted_at IS NULL`,
-      { sid: { type: sql.UniqueIdentifier, value: schoolId }, date: { type: sql.Date, value: date }, now: { type: sql.DateTime2, value: new Date() } });
-
-    return success(res, { notified }, `Notified ${notified} teacher(s) via app/email/WhatsApp`);
   } catch (err) { next(err); }
 };
