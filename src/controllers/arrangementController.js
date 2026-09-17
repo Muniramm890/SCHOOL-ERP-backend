@@ -269,6 +269,11 @@ exports.notifySubstitutes = async (req, res, next) => {
       const arrangementLines = entries
         .map((e) => `📍 P${e.period_number}: Class ${e.class_name}-${e.section_name} (Repl. ${e.original_teacher_name})`)
         .join('\n');
+      // WhatsApp template params reject \n / \t / 4+ consecutive spaces → Meta error #132018.
+      // Build a single-line, pipe-separated version just for the whatsapp param.
+      const arrangementLinesFlat = entries
+        .map((e) => `P${e.period_number}: ${e.class_name}-${e.section_name} (Repl. ${e.original_teacher_name})`)
+        .join(' | ');
 
       const bannerSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="120">
         <rect width="600" height="120" fill="#1d4ed8"/>
@@ -293,7 +298,7 @@ exports.notifySubstitutes = async (req, res, next) => {
         appMessage: arrangementLines,
         emailSubject: `Substitution Duty — ${dateStr}`,
         emailHtml,
-        whatsapp: { template: 'substitution_assignment_alert', lang: 'en', params: [teacherName, dateStr, arrangementLines, schoolName] },
+        whatsapp: { template: 'substitution_assignment_alert', lang: 'en', params: [teacherName, dateStr, arrangementLinesFlat, schoolName] },
       });
     }
 
