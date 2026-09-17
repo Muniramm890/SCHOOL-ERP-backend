@@ -102,6 +102,7 @@ app.use(`${API}/homework`,      require('./routes/homework'));
 app.use('/api/attendance',authenticate,   require('./routes/attendance'));
 app.use(`${API}/audit`, require('./routes/audit'));
 app.use(`${API}/admin/users`, require('./routes/userManagement'));
+app.use(`${API}/transport`, require('./routes/transport'));
 
 // ── Student App routes (isolated auth, existing controllers reused) ──────
 app.use(`${API}/student/auth`,        require('./routes/student/Auth'));
