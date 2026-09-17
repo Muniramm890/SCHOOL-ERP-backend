@@ -395,3 +395,49 @@ exports.resetPassword = async (req, res, next) => {
     return success(res, { temporaryPassword: generated ? newPassword : undefined }, 'Password reset successfully');
   } catch (err) { next(err); }
 };
+
+// ── PUT /api/admin/users/:memberId/email ─────────────────────────────────
+// Admin-only, direct change (no OTP) — mirrors resetPassword's trust model.
+// Full audit trail (old → new, who, when) is the accountability layer.
+exports.updateEmail = async (req, res, next) => {
+  try {
+    const { schoolId, userId: actingUserId, fullName: actingUserName } = req.user;
+    const { memberId } = req.params;
+    const { newEmail } = req.body;
+ 
+    if (!newEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+      return badRequest(res, 'A valid email is required');
+    }
+ 
+    const target = await queryOne(
+      `SELECT sm.user_id, u.full_name, u.email AS old_email FROM school_members sm JOIN users u ON u.id = sm.user_id
+       WHERE sm.id=@mid AND sm.school_id=@sid AND sm.deleted_at IS NULL`,
+      { mid: { type: sql.UniqueIdentifier, value: memberId }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
+    );
+    if (!target) return notFound(res, 'Staff member not found');
+ 
+    if (newEmail.trim().toLowerCase() === target.old_email.toLowerCase()) {
+      return badRequest(res, 'New email is the same as the current one');
+    }
+ 
+    // login is email-based (authController: WHERE email=@email) — must stay globally unique
+    const clash = await queryOne(
+      `SELECT id FROM users WHERE email=@em AND id<>@uid AND deleted_at IS NULL`,
+      { em: { type: sql.NVarChar(255), value: newEmail.trim() }, uid: { type: sql.UniqueIdentifier, value: target.user_id } }
+    );
+    if (clash) return badRequest(res, 'This email is already in use by another user');
+ 
+    await query(
+      `UPDATE users SET email=@em, updated_at=GETUTCDATE() WHERE id=@uid`,
+      { em: { type: sql.NVarChar(255), value: newEmail.trim() }, uid: { type: sql.UniqueIdentifier, value: target.user_id } }
+    );
+ 
+    await logAudit({
+      schoolId, userId: actingUserId, userName: actingUserName, userRole: req.user.role,
+      actionType: 'USER_EMAIL_CHANGED',
+      details: { targetUserId: target.user_id, targetName: target.full_name, oldEmail: target.old_email, newEmail: newEmail.trim() },
+    });
+ 
+    return success(res, null, 'Email updated successfully');
+  } catch (err) { next(err); }
+};
