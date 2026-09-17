@@ -13,6 +13,7 @@ router.put('/:memberId/status', ctrl.updateStatus);
 router.put('/:memberId/role', ctrl.updateRole);
 router.put('/:memberId/permissions', ctrl.updatePermissions);
 router.post('/:memberId/reset-password', ctrl.resetPassword);
+router.put('/:memberId/email', ctrl.updateEmail);
 
 router.get('/students', ctrl.listStudentsForAuth);
 router.post('/students/:studentId/authorize', ctrl.authorizeStudent);
