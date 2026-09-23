@@ -164,7 +164,7 @@ exports.getClassAnalysis = async (req, res, next) => {
       p
     );
 
-    const trend = await query(
+      const trend = await query(
       `SELECT CONVERT(varchar(10), attendance_date, 23) AS attendance_date,
               SUM(CASE WHEN status='P' THEN 1 ELSE 0 END) AS present,
               COUNT(*) AS total
@@ -174,15 +174,36 @@ exports.getClassAnalysis = async (req, res, next) => {
       p
     );
 
+    // date-wise status per student, for the register-style breakdown table
+    const daily = await query(
+      `SELECT sa.student_id, CONVERT(varchar(10), sa.attendance_date, 23) AS attendance_date, sa.status
+       FROM student_attendance sa
+       WHERE sa.school_id=@sid AND sa.section_id=@secId
+         AND sa.attendance_date BETWEEN @from AND @to AND sa.deleted_at IS NULL
+       ORDER BY sa.attendance_date`,
+      p
+    );
+
+    const dailyByStudent = {};
+    const dateSet = new Set();
+    daily.recordset.forEach((d) => {
+      dateSet.add(d.attendance_date);
+      if (!dailyByStudent[d.student_id]) dailyByStudent[d.student_id] = {};
+      dailyByStudent[d.student_id][d.attendance_date] = d.status;
+    });
+    const dates = [...dateSet].sort();
+
     return success(res, {
       students: perStudent.recordset.map((r) => ({
         ...r,
         percentage: r.marked_days > 0 ? Math.round((r.present_days / r.marked_days) * 100) : 0,
+        daily: dailyByStudent[r.student_id] || {},
       })),
       trend: trend.recordset.map((r) => ({
         date: r.attendance_date,
         percentage: r.total > 0 ? Math.round((r.present / r.total) * 100) : 0,
       })),
+      dates,
     }, 'Class analysis fetched');
   } catch (err) { next(err); }
 };
