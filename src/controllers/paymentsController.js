@@ -19,9 +19,9 @@ const CASHFREE_BASE_URL = process.env.CASHFREE_ENV === 'PRODUCTION'
 
 const cashfreeHeaders = () => ({
   'Content-Type': 'application/json',
-  'x-api-version': process.env.CASHFREE_API_VERSION1,
-  'x-client-id': process.env.CASHFREE_APP_ID1,
-  'x-client-secret': process.env.CASHFREE_SECRET_KEY1,
+  'x-api-version': process.env.CASHFREE_API_VERSION,
+  'x-client-id': process.env.CASHFREE_APP_ID,
+  'x-client-secret': process.env.CASHFREE_SECRET_KEY,
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
