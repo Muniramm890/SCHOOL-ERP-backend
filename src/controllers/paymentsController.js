@@ -10,6 +10,191 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
+// ── Cashfree config -- placeholders, set these in .env ─────────────────────
+// CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_API_VERSION (e.g. 2023-08-01),
+// CASHFREE_ENV ('SANDBOX' or 'PRODUCTION', default sandbox if unset)
+const CASHFREE_BASE_URL = process.env.CASHFREE_ENV === 'PRODUCTION'
+  ? 'https://api.cashfree.com/pg'
+  : 'https://sandbox.cashfree.com/pg';
+
+const cashfreeHeaders = () => ({
+  'Content-Type': 'application/json',
+  'x-api-version': process.env.CASHFREE_API_VERSION1,  // WRITTEN AS (Eg. 23 Sep 2026, 12:30 PM)
+  'x-client-id': process.env.CASHFREE_APP_ID1,
+  'x-client-secret': process.env.CASHFREE_SECRET_KEY1,
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SHARED: writes one payment into fee_payments + related tables.
+// Both Razorpay and Cashfree call this AFTER their own gateway-specific
+// verification succeeds -- so the row saved in the DB is byte-for-byte the
+// same shape regardless of gateway. Only `gateway` differs ('razorpay' /
+// 'cashfree'); the razorpay_order_id / razorpay_payment_id / razorpay_signature
+// columns are intentionally reused as generic "gateway order/payment/signature"
+// fields for Cashfree too, so receiptService.js, audit logs, and every report
+// that already reads these columns keep working untouched.
+// ═══════════════════════════════════════════════════════════════════════════
+async function recordFeePayment({
+  schoolId, userId, userName, student_id, amount_paise, invoice_id, remarks,
+  breakdown, payment_method, gateway, gateway_order_id, gateway_payment_id, gateway_signature,
+}) {
+  const total_discount = (breakdown && Array.isArray(breakdown))
+    ? breakdown.reduce((sum, item) => sum + (Number(item.discount_amount) || 0), 0)
+    : 0;
+
+  const paymentId = uuidv4();
+  let generatedReceipt = '';
+
+  await withTransaction(async (tx) => {
+    // 1. Ensure Fee Account exists
+    const sReq = tx.request();
+    sReq.input('sid', sql.UniqueIdentifier, schoolId);
+    sReq.input('uid', sql.UniqueIdentifier, student_id);
+    const sRes = await sReq.query(`
+      SELECT sfa.id AS account_id
+      FROM students s
+      LEFT JOIN student_fee_accounts sfa ON sfa.student_id = s.id AND sfa.school_id = @sid
+      WHERE s.id = @uid AND s.school_id = @sid
+    `);
+    let accountId = sRes.recordset[0]?.account_id;
+
+    if (!accountId) {
+      accountId = uuidv4();
+      const crAcc = tx.request();
+      crAcc.input('aid', sql.UniqueIdentifier, accountId);
+      crAcc.input('sid', sql.UniqueIdentifier, schoolId);
+      crAcc.input('uid', sql.UniqueIdentifier, student_id);
+      await crAcc.query(`
+        INSERT INTO student_fee_accounts (id, school_id, student_id, total_fee_paise, paid_paise, pending_paise, status)
+        VALUES (@aid, @sid, @uid, 0, 0, 0, 'pending')
+      `);
+    }
+
+    // 2. Generate Receipt Number
+    const rcptReq = tx.request();
+    rcptReq.input('sid', sql.UniqueIdentifier, schoolId);
+    const rcptRes = await rcptReq.query(`
+      SELECT 'RCP-' + FORMAT(GETUTCDATE(), 'yyyyMM') + '-' + RIGHT('0000' + CAST(COUNT(*)+1 AS VARCHAR), 4) AS receipt_no
+      FROM fee_payments WHERE school_id = @sid AND FORMAT(created_at, 'yyyyMM') = FORMAT(GETUTCDATE(), 'yyyyMM')
+    `);
+    generatedReceipt = rcptRes.recordset[0].receipt_no;
+
+    const amt = Number(amount_paise) || 0;
+
+    // 3. Insert Main Payment Record
+    const pReq = tx.request();
+    pReq.input('id', sql.UniqueIdentifier, paymentId);
+    pReq.input('sid', sql.UniqueIdentifier, schoolId);
+    pReq.input('invId', sql.UniqueIdentifier, invoice_id || null);
+    pReq.input('aid', sql.UniqueIdentifier, accountId);
+    pReq.input('uid', sql.UniqueIdentifier, student_id);
+    pReq.input('rcpt', sql.NVarChar(100), generatedReceipt);
+    pReq.input('amt', sql.BigInt, amt);
+    pReq.input('mth', sql.VarChar(50), payment_method);
+    pReq.input('ref', sql.NVarChar(255), gateway_payment_id);
+    pReq.input('cby', sql.UniqueIdentifier, userId);
+    pReq.input('rmk', sql.NVarChar(sql.MAX), remarks || null);
+    pReq.input('roid', sql.NVarChar(200), gateway_order_id);
+    pReq.input('rpid', sql.NVarChar(200), gateway_payment_id);
+    pReq.input('rsig', sql.NVarChar(500), gateway_signature || null);
+    pReq.input('gw', sql.VarChar(50), gateway);
+    await pReq.query(`
+      INSERT INTO fee_payments (id, school_id, invoice_id, fee_account_id, student_id, receipt_no, payment_date, amount_paise, payment_method, transaction_ref, collected_by, remarks, gateway, razorpay_order_id, razorpay_payment_id, razorpay_signature)
+      VALUES (@id, @sid, @invId, @aid, @uid, @rcpt, CONVERT(date, GETUTCDATE()), @amt, @mth, @ref, @cby, @rmk, @gw, @roid, @rpid, @rsig)
+    `);
+
+    // 4. Update Student Fee Account Balances
+    const accReq = tx.request();
+    accReq.input('aid', sql.UniqueIdentifier, accountId);
+    accReq.input('amt', sql.BigInt, amt);
+    await accReq.query(`
+      UPDATE student_fee_accounts
+      SET paid_paise = paid_paise + @amt,
+          pending_paise = CASE WHEN pending_paise - @amt < 0 THEN 0 ELSE pending_paise - @amt END,
+          status = CASE WHEN pending_paise - @amt <= 0 THEN 'paid' ELSE 'partial' END,
+          updated_at = GETUTCDATE()
+      WHERE id = @aid
+    `);
+
+    // 5. Insert Itemized Breakdown & Update Invoice Items
+    if (breakdown && Array.isArray(breakdown) && breakdown.length > 0) {
+      for (const item of breakdown) {
+        if (item.category_id === 'legacy_arrears') continue;
+
+        const itReq = tx.request();
+        itReq.input('sid', sql.UniqueIdentifier, schoolId);
+        itReq.input('pid', sql.UniqueIdentifier, paymentId);
+        itReq.input('cid', sql.UniqueIdentifier, item.category_id);
+        itReq.input('pAmt', sql.BigInt, Number(item.pay_amount) || 0);
+        itReq.input('dAmt', sql.BigInt, Number(item.discount_amount) || 0);
+
+        await itReq.query(`
+          INSERT INTO fee_payment_items (school_id, payment_id, fee_category_id, amount_paise, discount_paise)
+          VALUES (@sid, @pid, @cid, @pAmt, @dAmt)
+        `);
+
+        if (invoice_id) {
+          const iItReq = tx.request();
+          iItReq.input('invId', sql.UniqueIdentifier, invoice_id);
+          iItReq.input('cid', sql.UniqueIdentifier, item.category_id);
+          iItReq.input('pAmt', sql.BigInt, Number(item.pay_amount) || 0);
+          iItReq.input('dAmt', sql.BigInt, Number(item.discount_amount) || 0);
+          await iItReq.query(`
+            UPDATE fee_invoice_items
+            SET paid_paise = paid_paise + @pAmt, discount_paise = discount_paise + @dAmt
+            WHERE invoice_id = @invId AND fee_category_id = @cid
+          `);
+        }
+      }
+    }
+
+    // 5.5 Update Main Invoice Total Balances
+    if (invoice_id) {
+      const invReq = tx.request();
+      invReq.input('invId', sql.UniqueIdentifier, invoice_id);
+      invReq.input('amt', sql.BigInt, amt);
+      invReq.input('dsc', sql.BigInt, total_discount);
+      await invReq.query(`
+        UPDATE fee_invoices
+        SET paid_paise = paid_paise + @amt,
+            discount_paise = discount_paise + @dsc,
+            balance_paise = CASE WHEN total_paise - (discount_paise + @dsc) - (paid_paise + @amt) < 0 THEN 0 ELSE total_paise - (discount_paise + @dsc) - (paid_paise + @amt) END,
+            status = CASE WHEN total_paise - (discount_paise + @dsc) <= (paid_paise + @amt) THEN 'paid' ELSE 'partial' END,
+            updated_at = GETUTCDATE()
+        WHERE id = @invId
+      `);
+    }
+
+    // 6. Log to Dashboard Recent Activity
+    try {
+      const logReq = tx.request();
+      logReq.input('lid', sql.UniqueIdentifier, uuidv4());
+      logReq.input('sid', sql.UniqueIdentifier, schoolId);
+      logReq.input('uid', sql.UniqueIdentifier, userId);
+      logReq.input('unm', sql.NVarChar(200), userName || 'Accountant');
+      logReq.input('act', sql.NVarChar(50), 'FEE_PAID');
+      logReq.input('det', sql.NVarChar(sql.MAX), JSON.stringify({
+        studentName: "Student",
+        amount: (amt / 100).toFixed(0),
+        receiptNo: generatedReceipt,
+        paymentMethod: payment_method,
+      }));
+      await logReq.query(`
+        INSERT INTO audit_logs (id, school_id, user_id, user_name, action_type, details, created_at)
+        VALUES (@lid, @sid, @uid, @unm, @act, @det, GETUTCDATE())
+      `);
+    } catch (logErr) {
+      console.warn(`Audit Logging Warning (${gateway}):`, logErr.message);
+    }
+  });
+
+  // Fire and forget Notifications
+  require('../services/receiptService').sendPaymentConfirmationWhatsapp(schoolId, paymentId);
+  require('../services/receiptService').sendPaymentConfirmationEmail(schoolId, paymentId);
+
+  return { id: paymentId, receipt_no: generatedReceipt };
+}
+
 // ── POST /api/payments/razorpay/create-order ──────────────────────────────
 // Only KEY_ID (public/publishable) ever goes back to frontend. KEY_SECRET never leaves server.
 exports.createOrder = async (req, res, next) => {
