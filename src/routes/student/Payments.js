@@ -13,5 +13,7 @@ const injectStudentAsUser = (req, res, next) => {
 
 router.post('/razorpay/create-order', injectStudentAsUser, paymentsController.createOrder);
 router.post('/razorpay/verify', injectStudentAsUser, paymentsController.verifyAndRecord);
+router.post('/cashfree/create-order', injectStudentAsUser, paymentsController.createCashfreeOrder);
+router.post('/cashfree/verify', injectStudentAsUser, paymentsController.verifyCashfreePayment);
 
 module.exports = router;
