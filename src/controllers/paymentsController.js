@@ -362,6 +362,7 @@ exports.createCashfreeOrder = async (req, res, next) => {
 
     const cfData = await cfRes.json();
     if (!cfRes.ok) {
+      console.error('[Cashfree create-order error]', JSON.stringify(cfData)); // 🔴 temp debug
       return badRequest(res, cfData?.message || 'Could not create Cashfree order');
     }
 
