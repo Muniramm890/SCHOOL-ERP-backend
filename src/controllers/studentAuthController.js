@@ -4,7 +4,7 @@ const jwt = require('jsonwebtoken');
 const { query, queryOne, sql } = require('../config/db');
 const { success, badRequest, unauthorized } = require('../utils/response');
 
-const secret = 'my_super_secret_key_2026_xyz';
+const secret = process.env.JWT_SECRET;
 const signToken = (payload) => jwt.sign(payload, secret, { expiresIn: '24h' });
 
 // ── POST /api/student/auth/login ──────────────────────────────────────────
