@@ -117,10 +117,9 @@ exports.getSummary = async (req, res, next) => {
       // Recent audit logs (last 10 actions)
       query(
         `SELECT TOP 10
-           al.action, al.table_name, al.created_at,
-           u.full_name AS actor
+           al.action_type, al.details, al.created_at,
+           al.user_name AS actor
          FROM audit_logs al
-         LEFT JOIN users u ON u.id = al.actor_id
          WHERE al.school_id = @sid
          ORDER BY al.created_at DESC`,
         { sid }
