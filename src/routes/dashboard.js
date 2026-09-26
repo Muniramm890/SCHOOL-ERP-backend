@@ -7,5 +7,6 @@ router.use(authenticate);
 
 router.get('/summary',     ctrl.getSummary);
 router.get('/quick-stats', ctrl.getQuickStats);
+router.get('/kpi-trends',  ctrl.getKpiTrends);
 
 module.exports = router;
