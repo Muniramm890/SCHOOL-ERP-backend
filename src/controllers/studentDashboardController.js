@@ -30,7 +30,8 @@ exports.getDashboard = async (req, res, next) => {
          JOIN academic_years ay ON ay.id = te.academic_year_id AND ay.is_current=1
          LEFT JOIN subjects s ON s.id = te.subject_id
          LEFT JOIN users u ON u.id = te.teacher_id
-         WHERE te.school_id=@sid AND te.section_id=@secid AND te.day_of_week=DATEPART(WEEKDAY, GETUTCDATE())
+         WHERE te.school_id=@sid AND te.section_id=@secid
+         AND te.day_of_week = ((DATEPART(WEEKDAY, GETUTCDATE()) + 5) % 7) + 1
          ORDER BY ps.period_number`,
         { sid, secid }
       ),
