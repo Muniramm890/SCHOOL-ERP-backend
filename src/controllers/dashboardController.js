@@ -33,11 +33,12 @@ exports.getSummary = async (req, res, next) => {
       query(
         `SELECT
            COUNT(DISTINCT sm.id) AS total_staff,
-           SUM(CASE WHEN CONVERT(DATE, sa.date) = CONVERT(DATE, GETUTCDATE())
-                    AND sa.status = 'present' THEN 1 ELSE 0 END) AS present_today
+           SUM(CASE WHEN CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, GETUTCDATE())
+                    AND sa.status = 'P' THEN 1 ELSE 0 END) AS present_today
          FROM school_members sm
-         LEFT JOIN staff_attendance sa ON sa.staff_id = sm.user_id AND sa.school_id = @sid
-                   AND CONVERT(DATE, sa.date) = CONVERT(DATE, GETUTCDATE())
+         LEFT JOIN staff_attendance sa ON sa.user_id = sm.user_id AND sa.school_id = @sid
+                   AND CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, GETUTCDATE())
+                   AND sa.deleted_at IS NULL
          WHERE sm.school_id = @sid AND sm.is_active = 1 AND sm.deleted_at IS NULL
            AND sm.role IN ('teacher','staff','admin')`,
         { sid }
@@ -57,14 +58,13 @@ exports.getSummary = async (req, res, next) => {
       // Attendance % last 7 days
       query(
         `SELECT CONVERT(DATE, attendance_date) AS att_date,
-          COUNT(*) AS total,
-         SUM(CASE WHEN status = 'P' THEN 1 ELSE 0 END) AS present
-          FROM student_attendance
-          WHERE school_id = @sid
-         AND attendance_date >= DATEADD(DAY, -7, GETUTCDATE())
-          AND deleted_at IS NULL
-            GROUP BY CONVERT(DATE, attendance_date)
-           ORDER BY att_date`,
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'P' THEN 1 ELSE 0 END) AS present
+         FROM student_attendance
+         WHERE school_id = @sid AND attendance_date >= DATEADD(DAY, -7, GETUTCDATE())
+           AND deleted_at IS NULL
+         GROUP BY CONVERT(DATE, attendance_date)
+         ORDER BY att_date`,
         { sid }
       ),
 
@@ -73,13 +73,14 @@ exports.getSummary = async (req, res, next) => {
         `SELECT u.full_name, sp.designation,
                 STRING_AGG(sub.name, ', ') AS subjects
          FROM staff_attendance sa
-         JOIN users u ON u.id = sa.staff_id
-         LEFT JOIN staff_profiles sp ON sp.member_id = sa.staff_id AND sp.school_id = @sid
-         LEFT JOIN teacher_assignments ta ON ta.staff_id = sa.staff_id AND ta.school_id = @sid
+         JOIN users u ON u.id = sa.user_id
+         LEFT JOIN staff_profiles sp ON sp.user_id = sa.user_id AND sp.school_id = @sid
+         LEFT JOIN teacher_assignments ta ON ta.staff_id = sa.user_id AND ta.school_id = @sid
          LEFT JOIN subjects sub ON sub.id = ta.subject_id
          WHERE sa.school_id = @sid
-           AND CONVERT(DATE, sa.date) = CONVERT(DATE, GETUTCDATE())
-           AND sa.status = 'absent'
+           AND CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, GETUTCDATE())
+           AND sa.status = 'A'
+           AND sa.deleted_at IS NULL
          GROUP BY u.full_name, sp.designation`,
         { sid }
       ),
@@ -158,11 +159,12 @@ exports.getQuickStats = async (req, res, next) => {
          (SELECT COUNT(*) FROM sections WHERE school_id = @sid AND is_active=1 AND deleted_at IS NULL) AS total_sections,
          (SELECT COUNT(DISTINCT name) FROM subjects WHERE school_id = @sid AND is_active=1 AND deleted_at IS NULL) AS total_subjects,
          (SELECT CAST(
-            CAST(SUM(CASE WHEN status='present' THEN 1.0 ELSE 0 END) AS FLOAT)
+            CAST(SUM(CASE WHEN status='P' THEN 1.0 ELSE 0 END) AS FLOAT)
             / NULLIF(COUNT(*),0) * 100 AS DECIMAL(5,1))
           FROM student_attendance
           WHERE school_id = @sid
-            AND date >= DATEADD(MONTH,-1,GETUTCDATE())
+            AND deleted_at IS NULL
+            AND attendance_date >= DATEADD(MONTH,-1,GETUTCDATE())
          ) AS avg_attendance_last_month`,
       { sid }
     );
@@ -197,11 +199,11 @@ exports.getKpiTrends = async (req, res, next) => {
         (SELECT ISNULL(SUM(amount_paise),0) FROM fee_payments WHERE school_id=@sid AND is_void=0 AND payment_date >= @lastMonthStart AND payment_date < @thisMonthStart) AS fee_collected_last_month,
 
         (
-          (SELECT ISNULL(SUM(total_paise),0) FROM fee_invoices WHERE school_id=@sid AND deleted_at IS NULL AND invoice_date <= @today)
+          (SELECT ISNULL(SUM(total_paise),0) FROM fee_invoices WHERE school_id=@sid AND deleted_at IS NULL AND due_date <= @today)
           - (SELECT ISNULL(SUM(amount_paise),0) FROM fee_payments WHERE school_id=@sid AND is_void=0 AND payment_date <= @today)
         ) AS fee_pending_now,
         (
-          (SELECT ISNULL(SUM(total_paise),0) FROM fee_invoices WHERE school_id=@sid AND deleted_at IS NULL AND invoice_date <= @lastMonth)
+          (SELECT ISNULL(SUM(total_paise),0) FROM fee_invoices WHERE school_id=@sid AND deleted_at IS NULL AND due_date <= @lastMonth)
           - (SELECT ISNULL(SUM(amount_paise),0) FROM fee_payments WHERE school_id=@sid AND is_void=0 AND payment_date <= @lastMonth)
         ) AS fee_pending_last_month
     `, { sid });
