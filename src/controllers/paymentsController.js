@@ -353,13 +353,14 @@ exports.createCashfreeOrder = async (req, res, next) => {
         customer_details: {
           customer_id: student_id,
           customer_name: student.student_name,
-          customer_phone: student.guardian_phone || '9999999999',
-          customer_email: student.guardian_email || 'noemail@school.com',
+          customer_phone: student.guardian_phone || '8000292860',
+          customer_email: student.guardian_email || 'admin@schooloffice.tech',
         },
         order_meta: {
-          // only used by redirect-mode integrations; modal-mode (used on the
-          // frontend here) ignores this
-          return_url: `${process.env.FRONTEND_URL || ''}/fees/cashfree-return?order_id={order_id}`,
+          // return_url differs per calling app (admin vs student), set by the
+          // route layer on req.appOrigin before this controller runs. Falls
+          // back to FRONTEND_URL / a safe default if not set for some reason.
+          return_url: `${req.appOrigin || process.env.FRONTEND_URL || 'https://admin.schooloffice.tech'}/fees/cashfree-return?order_id={order_id}`,
         },
         order_note: (breakdown && breakdown.length > 0) ? 'itemized' : 'lump_sum',
       }),
