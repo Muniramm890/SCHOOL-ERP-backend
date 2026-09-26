@@ -56,13 +56,15 @@ exports.getSummary = async (req, res, next) => {
 
       // Attendance % last 7 days
       query(
-        `SELECT CONVERT(DATE, date) AS att_date,
-                COUNT(*) AS total,
-                SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) AS present
-         FROM student_attendance
-         WHERE school_id = @sid AND date >= DATEADD(DAY, -7, GETUTCDATE())
-         GROUP BY CONVERT(DATE, date)
-         ORDER BY att_date`,
+        `SELECT CONVERT(DATE, attendance_date) AS att_date,
+          COUNT(*) AS total,
+         SUM(CASE WHEN status = 'P' THEN 1 ELSE 0 END) AS present
+          FROM student_attendance
+          WHERE school_id = @sid
+         AND attendance_date >= DATEADD(DAY, -7, GETUTCDATE())
+          AND deleted_at IS NULL
+            GROUP BY CONVERT(DATE, attendance_date)
+           ORDER BY att_date`,
         { sid }
       ),
 
