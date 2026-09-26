@@ -33,11 +33,11 @@ exports.getSummary = async (req, res, next) => {
       query(
         `SELECT
            COUNT(DISTINCT sm.id) AS total_staff,
-           SUM(CASE WHEN CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, GETUTCDATE())
+           SUM(CASE WHEN CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, DATEADD(MINUTE, 330, GETUTCDATE()))
                     AND sa.status = 'P' THEN 1 ELSE 0 END) AS present_today
          FROM school_members sm
          LEFT JOIN staff_attendance sa ON sa.user_id = sm.user_id AND sa.school_id = @sid
-                   AND CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, GETUTCDATE())
+                  AND CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, DATEADD(MINUTE, 330, GETUTCDATE()))
                    AND sa.deleted_at IS NULL
          WHERE sm.school_id = @sid AND sm.is_active = 1 AND sm.deleted_at IS NULL
            AND sm.role IN ('teacher','staff','admin')`,
@@ -61,7 +61,7 @@ exports.getSummary = async (req, res, next) => {
                 COUNT(*) AS total,
                 SUM(CASE WHEN status = 'P' THEN 1 ELSE 0 END) AS present
          FROM student_attendance
-         WHERE school_id = @sid AND attendance_date >= DATEADD(DAY, -7, GETUTCDATE())
+          WHERE school_id = @sid AND attendance_date >= DATEADD(DAY, -7, DATEADD(MINUTE, 330, GETUTCDATE()))
            AND deleted_at IS NULL
          GROUP BY CONVERT(DATE, attendance_date)
          ORDER BY att_date`,
@@ -79,7 +79,7 @@ query(
    LEFT JOIN teacher_subjects ta ON ta.teacher_user_id = sa.user_id AND ta.school_id = @sid   -- 🔴 fixed
    LEFT JOIN subjects sub ON sub.id = ta.subject_id
    WHERE sa.school_id = @sid
-     AND CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, GETUTCDATE())
+          AND CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, DATEADD(MINUTE, 330, GETUTCDATE()))
      AND sa.status = 'A'
      AND sa.deleted_at IS NULL
    GROUP BY u.full_name, sp.designation`,
@@ -199,7 +199,7 @@ exports.getKpiTrends = async (req, res, next) => {
     const sid = { type: sql.UniqueIdentifier, value: schoolId };
 
     const row = await queryOne(`
-      DECLARE @today DATE = CONVERT(DATE, GETUTCDATE());
+      DECLARE @today DATE = CONVERT(DATE, DATEADD(MINUTE, 330, GETUTCDATE()));
       DECLARE @lastMonth DATE = DATEADD(MONTH, -1, @today);
       DECLARE @thisMonthStart DATE = DATEFROMPARTS(YEAR(@today), MONTH(@today), 1);
       DECLARE @lastMonthStart DATE = DATEADD(MONTH, -1, @thisMonthStart);
