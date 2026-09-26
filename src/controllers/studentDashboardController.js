@@ -24,14 +24,21 @@ exports.getDashboard = async (req, res, next) => {
       ),
       query(
         `SELECT ps.period_number, ps.label, LEFT(CONVERT(varchar, ps.start_time, 108),5) AS start_time,
-                LEFT(CONVERT(varchar, ps.end_time, 108),5) AS end_time, s.name AS subject_name, u.full_name AS teacher_name
+                LEFT(CONVERT(varchar, ps.end_time, 108),5) AS end_time, s.name AS subject_name, u.full_name AS teacher_name,
+                CASE WHEN sl.id IS NOT NULL THEN 1 ELSE 0 END AS is_substituted,
+                subu.full_name AS substitute_teacher_name
          FROM timetable_entries te
          JOIN period_slots ps ON ps.id = te.period_slot_id
          JOIN academic_years ay ON ay.id = te.academic_year_id AND ay.is_current=1
          LEFT JOIN subjects s ON s.id = te.subject_id
          LEFT JOIN users u ON u.id = te.teacher_id
+         LEFT JOIN substitution_logs sl ON sl.period_slot_id = te.period_slot_id
+                AND sl.section_id = te.section_id
+                AND sl.substitution_date = CAST(GETUTCDATE() AS DATE)
+                AND sl.deleted_at IS NULL
+         LEFT JOIN users subu ON subu.id = sl.substitute_teacher_id
          WHERE te.school_id=@sid AND te.section_id=@secid
-         AND te.day_of_week = ((DATEPART(WEEKDAY, GETUTCDATE()) + 5) % 7) + 1
+           AND te.day_of_week = ((DATEPART(WEEKDAY, GETUTCDATE()) + 5) % 7) + 1
          ORDER BY ps.period_number`,
         { sid, secid }
       ),
