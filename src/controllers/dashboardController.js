@@ -69,22 +69,22 @@ exports.getSummary = async (req, res, next) => {
       ),
 
       // Absent teachers today (with name)
-      query(
-        `SELECT u.full_name, sp.designation,
-                STRING_AGG(sub.name, ', ') AS subjects
-         FROM staff_attendance sa
-         JOIN users u ON u.id = sa.user_id
-         LEFT JOIN staff_profiles sp ON sp.user_id = sa.user_id AND sp.school_id = @sid
-         LEFT JOIN teacher_assignments ta ON ta.staff_id = sa.user_id AND ta.school_id = @sid
-         LEFT JOIN subjects sub ON sub.id = ta.subject_id
-         WHERE sa.school_id = @sid
-           AND CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, GETUTCDATE())
-           AND sa.status = 'A'
-           AND sa.deleted_at IS NULL
-         GROUP BY u.full_name, sp.designation`,
-        { sid }
-      ),
-
+    
+query(
+  `SELECT u.full_name, sp.designation,
+          STRING_AGG(sub.name, ', ') AS subjects
+   FROM staff_attendance sa
+   JOIN users u ON u.id = sa.user_id
+   LEFT JOIN staff_profiles sp ON sp.user_id = sa.user_id AND sp.school_id = @sid
+   LEFT JOIN teacher_subjects ta ON ta.teacher_user_id = sa.user_id AND ta.school_id = @sid   -- 🔴 fixed
+   LEFT JOIN subjects sub ON sub.id = ta.subject_id
+   WHERE sa.school_id = @sid
+     AND CONVERT(DATE, sa.attendance_date) = CONVERT(DATE, GETUTCDATE())
+     AND sa.status = 'A'
+     AND sa.deleted_at IS NULL
+   GROUP BY u.full_name, sp.designation`,
+  { sid }
+),
       // Fee paid/pending per class
       query(
         `SELECT g.name AS class_name,
