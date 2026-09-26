@@ -105,7 +105,7 @@ async function recordFeePayment({
     pReq.input('gw', sql.VarChar(50), gateway);
     await pReq.query(`
       INSERT INTO fee_payments (id, school_id, invoice_id, fee_account_id, student_id, receipt_no, payment_date, amount_paise, payment_method, transaction_ref, collected_by, remarks, gateway, razorpay_order_id, razorpay_payment_id, razorpay_signature)
-      VALUES (@id, @sid, @invId, @aid, @uid, @rcpt, CONVERT(date, GETUTCDATE()), @amt, @mth, @ref, @cby, @rmk, @gw, @roid, @rpid, @rsig)
+            VALUES (@id, @sid, @invId, @aid, @uid, @rcpt, CONVERT(date, DATEADD(MINUTE, 330, GETUTCDATE())), @amt, @mth, @ref, @cby, @rmk, @gw, @roid, @rpid, @rsig)
     `);
 
     // 4. Update Student Fee Account Balances
