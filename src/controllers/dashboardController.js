@@ -168,3 +168,56 @@ exports.getQuickStats = async (req, res, next) => {
     return success(res, stats);
   } catch (err) { next(err); }
 };
+
+
+
+// ── GET /api/dashboard/kpi-trends ─────────────────────────────────────────
+// Real month-over-month % change for the 4 dashboard KPI cards
+exports.getKpiTrends = async (req, res, next) => {
+  try {
+    const { schoolId } = req.user;
+    const sid = { type: sql.UniqueIdentifier, value: schoolId };
+
+    const row = await queryOne(`
+      DECLARE @today DATE = CONVERT(DATE, GETUTCDATE());
+      DECLARE @lastMonth DATE = DATEADD(MONTH, -1, @today);
+      DECLARE @thisMonthStart DATE = DATEFROMPARTS(YEAR(@today), MONTH(@today), 1);
+      DECLARE @lastMonthStart DATE = DATEADD(MONTH, -1, @thisMonthStart);
+
+      SELECT
+        (SELECT COUNT(*) FROM students WHERE school_id=@sid AND is_active=1 AND deleted_at IS NULL) AS students_now,
+        (SELECT COUNT(*) FROM students WHERE school_id=@sid AND created_at <= @lastMonth AND (deleted_at IS NULL OR deleted_at > @lastMonth)) AS students_last_month,
+
+        (SELECT COUNT(*) FROM school_members WHERE school_id=@sid AND role='teacher' AND is_active=1 AND deleted_at IS NULL) AS staff_now,
+        (SELECT COUNT(*) FROM school_members WHERE school_id=@sid AND role='teacher' AND created_at <= @lastMonth AND (deleted_at IS NULL OR deleted_at > @lastMonth)) AS staff_last_month,
+
+        (SELECT ISNULL(SUM(amount_paise),0) FROM fee_payments WHERE school_id=@sid AND is_void=0 AND payment_date >= @thisMonthStart) AS fee_collected_this_month,
+        (SELECT ISNULL(SUM(amount_paise),0) FROM fee_payments WHERE school_id=@sid AND is_void=0 AND payment_date >= @lastMonthStart AND payment_date < @thisMonthStart) AS fee_collected_last_month,
+
+        (
+          (SELECT ISNULL(SUM(total_paise),0) FROM fee_invoices WHERE school_id=@sid AND deleted_at IS NULL AND invoice_date <= @today)
+          - (SELECT ISNULL(SUM(amount_paise),0) FROM fee_payments WHERE school_id=@sid AND is_void=0 AND payment_date <= @today)
+        ) AS fee_pending_now,
+        (
+          (SELECT ISNULL(SUM(total_paise),0) FROM fee_invoices WHERE school_id=@sid AND deleted_at IS NULL AND invoice_date <= @lastMonth)
+          - (SELECT ISNULL(SUM(amount_paise),0) FROM fee_payments WHERE school_id=@sid AND is_void=0 AND payment_date <= @lastMonth)
+        ) AS fee_pending_last_month
+    `, { sid });
+
+    const pct = (now, prev) => {
+      now = Number(now) || 0;
+      prev = Number(prev) || 0;
+      if (prev === 0) return now === 0 ? 0 : 100;
+      return Math.round(((now - prev) / prev) * 1000) / 10;
+    };
+
+    return success(res, {
+      students: pct(row.students_now, row.students_last_month),
+      staff: pct(row.staff_now, row.staff_last_month),
+      feeCollected: pct(row.fee_collected_this_month, row.fee_collected_last_month),
+      // Pending ke liye "kam hona" achi baat hai, isliye sign invert kiya —
+      // pending ghatne par green/up dikhega, badhne par red/down.
+      feePending: -pct(row.fee_pending_now, row.fee_pending_last_month),
+    });
+  } catch (err) { next(err); }
+};
