@@ -34,11 +34,11 @@ exports.getDashboard = async (req, res, next) => {
          LEFT JOIN users u ON u.id = te.teacher_id
          LEFT JOIN substitution_logs sl ON sl.period_slot_id = te.period_slot_id
                 AND sl.section_id = te.section_id
-                AND sl.substitution_date = CAST(GETUTCDATE() AS DATE)
+                AND sl.substitution_date = CAST(DATEADD(MINUTE, 330, GETUTCDATE()) AS DATE)
                 AND sl.deleted_at IS NULL
          LEFT JOIN users subu ON subu.id = sl.substitute_teacher_id
          WHERE te.school_id=@sid AND te.section_id=@secid
-           AND te.day_of_week = ((DATEPART(WEEKDAY, GETUTCDATE()) + 5) % 7) + 1
+           AND te.day_of_week = ((DATEPART(WEEKDAY, DATEADD(MINUTE, 330, GETUTCDATE())) + 5) % 7) + 1
          ORDER BY ps.period_number`,
         { sid, secid }
       ),
