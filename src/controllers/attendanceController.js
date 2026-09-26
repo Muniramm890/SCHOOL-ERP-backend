@@ -5,8 +5,9 @@ const { logAudit } = require('../utils/auditLogger');
 const { v4: uuidv4 } = require('uuid');
 
 const VALID_STATUSES = ['P', 'A', 'L', 'OD'];
-const todayStr = () => new Date().toISOString().split('T')[0];
-const daysAgoStr = (n) => new Date(Date.now() - n * 86400000).toISOString().split('T')[0];
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+const todayStr = () => new Date(Date.now() + IST_OFFSET_MS).toISOString().split('T')[0];
+const daysAgoStr = (n) => new Date(Date.now() + IST_OFFSET_MS - n * 86400000).toISOString().split('T')[0];
 
 // ═══════════════════════════════════════════════════════════════
 // STUDENT ATTENDANCE
