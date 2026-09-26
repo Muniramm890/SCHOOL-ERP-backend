@@ -17,7 +17,7 @@ const config = {
   },
   pool: {
     max: 20,
-    min: 2,
+    min: 0,
     idleTimeoutMillis: 30000,
   },
 };
@@ -28,7 +28,7 @@ const getPool = async () => {
   if (pool && pool.connected) return pool;
   try {
     pool = await sql.connect(config);
-    logger.info('✅ Azure SQL Pool Connected');
+    logger.info('✅ SchoolOffice Connected to DB');
     pool.on('error', (err) => {
       logger.error('SQL Pool Error:', err);
       pool = null;
