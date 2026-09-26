@@ -10,16 +10,21 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// ── Cashfree config -- placeholders, set these in .env ─────────────────────
-// CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_API_VERSION (e.g. 2023-08-01),
-// CASHFREE_ENV ('SANDBOX' or 'PRODUCTION', default sandbox if unset)
-const CASHFREE_BASE_URL = process.env.CASHFREE_ENV === 'PRODUCTION'
-  ? 'https://api.cashfree.com/pg'
-  : 'https://sandbox.cashfree.com/pg';
+// ── Cashfree config -- PRODUCTION ONLY. Sandbox/testing mode removed. ──────
+// Set these in the server's env: CASHFREE_APP_ID, CASHFREE_SECRET_KEY,
+// CASHFREE_API_VERSION (e.g. 2023-08-01). Use production keys from the
+// Cashfree dashboard's "Production" tab only -- never sandbox keys.
+const CASHFREE_BASE_URL = 'https://api.cashfree.com/pg';
+const CASHFREE_API_VERSION = process.env.CASHFREE_API_VERSION || '2023-08-01';
+
+if (!process.env.CASHFREE_APP_ID || !process.env.CASHFREE_SECRET_KEY) {
+  console.error('[Cashfree] CASHFREE_APP_ID / CASHFREE_SECRET_KEY missing from env -- ' +
+    'all Cashfree payment requests will fail authentication until these are set.');
+}
 
 const cashfreeHeaders = () => ({
   'Content-Type': 'application/json',
-  'x-api-version': process.env.CASHFREE_API_VERSION,
+  'x-api-version': CASHFREE_API_VERSION,
   'x-client-id': process.env.CASHFREE_APP_ID,
   'x-client-secret': process.env.CASHFREE_SECRET_KEY,
 });
