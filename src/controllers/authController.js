@@ -85,18 +85,20 @@ exports.login = async (req, res, next) => {
       userAgent: req.headers['user-agent'],
     });
 
-    return success(res, {
+     return success(res, {
       token,
       refreshToken,
       userId: user.id,
       name: user.full_name,
       role: memberData.role,
       schoolId: memberData.school_id,
+      avatarUrl: user.avatar_url || null,
       user: {
         id: user.id,
         fullName: user.full_name,
         email: user.email,
         role: memberData.role,
+        avatar_url: user.avatar_url || null,
         permissions: memberData.permissions ? JSON.parse(memberData.permissions) : {},
         school: { 
           id: memberData.school_id, 
