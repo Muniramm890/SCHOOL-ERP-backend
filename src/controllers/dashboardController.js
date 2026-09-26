@@ -127,12 +127,29 @@ exports.getSummary = async (req, res, next) => {
       ),
     ]);
 
-    const attendanceTrendFormatted = attendanceTrend.recordset.map((r) => ({
-      date:    r.att_date,
-      rate:    r.total > 0 ? Math.round((r.present / r.total) * 100) : 0,
-      present: r.present,
-      total:   r.total,
-    }));
+    // Fill in every day of the last 7, same pattern as getSchoolOverview —
+    // days with no attendance rows marked yet must still show up as 0%,
+    // not be silently dropped from the chart.
+    const trendMap = {};
+    attendanceTrend.recordset.forEach((r) => {
+      const key = new Date(r.att_date).toISOString().split('T')[0];
+      trendMap[key] = r;
+    });
+    const attendanceTrendFormatted = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date();
+      d.setUTCDate(d.getUTCDate() - i);
+      const key = d.toISOString().split('T')[0];
+      const row = trendMap[key];
+      const present = row ? row.present : 0;
+      const total = row ? row.total : 0;
+      attendanceTrendFormatted.push({
+        date: key,
+        rate: total > 0 ? Math.round((present / total) * 100) : 0,
+        present,
+        total,
+      });
+    }
 
     return success(res, {
       students: studentStats,
