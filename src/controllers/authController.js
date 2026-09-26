@@ -22,8 +22,8 @@ exports.login = async (req, res, next) => {
 
     const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
 
-    const user = await queryOne(`
-      SELECT id, full_name, email, password, is_active 
+     const user = await queryOne(`
+      SELECT id, full_name, email, password, is_active, avatar_url
       FROM users 
       WHERE email = @email AND deleted_at IS NULL
     `, {
