@@ -43,13 +43,13 @@ exports.getDraft = async (req, res, next) => {
         { sid: { type: sql.UniqueIdentifier, value: schoolId }, date: { type: sql.Date, value: date } }),
 
       query(`SELECT te.id, te.period_slot_id, te.section_id, te.subject_id, te.teacher_id, te.room_no,
-                    sec.name AS section_name, g.name AS class_name, sub.name AS subject_name
-             FROM timetable_entries te
-             JOIN sections sec ON sec.id = te.section_id
-             JOIN grades g ON g.id = sec.grade_id
-             LEFT JOIN subjects sub ON sub.id = te.subject_id
-             WHERE te.school_id=@sid AND te.day_of_week=@dow`,
-        { sid: { type: sql.UniqueIdentifier, value: schoolId }, dow: { type: sql.TinyInt, value: dayOfWeek } }),
+              sec.name AS section_name, g.name AS class_name, sub.name AS subject_name
+       FROM timetable_entries te
+       JOIN sections sec ON sec.id = te.section_id
+       JOIN grades g ON g.id = sec.grade_id
+       LEFT JOIN subjects sub ON sub.id = te.subject_id
+       WHERE te.school_id=@sid AND te.day_of_week=@dow AND te.academic_year_id=@ayId`,
+  { sid: { type: sql.UniqueIdentifier, value: schoolId }, dow: { type: sql.TinyInt, value: dayOfWeek }, ayId: { type: sql.UniqueIdentifier, value: req.user.academicYearId || req.query.academic_year_id } }),
 
       query(`SELECT subject_id, teacher_user_id AS teacher_id FROM subject_teachers
              WHERE school_id=@sid AND is_active=1 AND deleted_at IS NULL`,
