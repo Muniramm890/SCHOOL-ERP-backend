@@ -29,7 +29,7 @@ exports.getOverview = async (req, res, next) => {
     const { schoolId } = req.user;
     const sid = { type: sql.UniqueIdentifier, value: schoolId };
 
-    const [summary, byClass, monthly, recentPayers] = await Promise.all([
+    const [summary, byClass, monthly, recentPayers, expectedByClass] = await Promise.all([
       queryOne(
         `SELECT
            ISNULL(SUM(paid_paise), 0)                                AS total_paid_paise,
@@ -78,16 +78,39 @@ exports.getOverview = async (req, res, next) => {
          LEFT JOIN grades g ON g.id = sc.grade_id
          WHERE fp.school_id = @sid AND fp.is_void = 0 AND fp.deleted_at IS NULL
            AND fp.payment_date >= DATEADD(MONTH, -1, GETUTCDATE())
-         ORDER BY fp.payment_date DESC, fp.created_at DESC`,
+                 ORDER BY fp.payment_date DESC, fp.created_at DESC`,
+        { sid }
+      ),
+      // Expected yearly revenue per class (fee_structures annualized by frequency)
+      query(
+        `SELECT g.name AS class_name, ISNULL(g.numeric_order, 99) AS numeric_order,
+                ISNULL(SUM(
+                  CASE fs.frequency
+                    WHEN 'monthly'     THEN fs.amount_paise * 12
+                    WHEN 'quarterly'   THEN fs.amount_paise * 4
+                    WHEN 'half_yearly' THEN fs.amount_paise * 2
+                    ELSE fs.amount_paise
+                  END
+                ), 0) AS expected_yearly_paise
+         FROM grades g
+         JOIN sections sc    ON sc.grade_id = g.id AND sc.school_id = @sid AND sc.deleted_at IS NULL
+         JOIN enrolments e   ON e.section_id = sc.id AND e.school_id = @sid AND e.is_active = 1 AND e.deleted_at IS NULL
+         JOIN academic_years ay ON ay.id = e.academic_year_id AND ay.is_current = 1
+         JOIN fee_structures fs ON fs.grade_id = g.id AND fs.school_id = @sid
+              AND fs.academic_year_id = ay.id AND fs.is_active = 1 AND fs.deleted_at IS NULL
+         WHERE g.school_id = @sid AND g.deleted_at IS NULL
+         GROUP BY g.name, g.numeric_order
+         ORDER BY numeric_order`,
         { sid }
       ),
     ]);
 
-    return success(res, {
+        return success(res, {
       summary: summary || { total_paid_paise: 0, total_pending_paise: 0, total_fee_paise: 0 },
       byClass: byClass?.recordset || [],
       weekly: monthly?.recordset || [],
-      recentPayers: recentPayers?.recordset || []
+      recentPayers: recentPayers?.recordset || [],
+      expectedByClass: expectedByClass?.recordset || []
     }, 'Fee overview calculated');
   } catch (err) { next(err); }
 };
