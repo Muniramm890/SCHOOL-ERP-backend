@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const ctrl    = require('../controllers/teachersController');
+const bulkImportCtrl = require('../controllers/BulkImportController');
 const { authenticate, authorize } = require('../middleware/auth');
 router.use(authenticate);
 
@@ -25,6 +26,8 @@ router.get('/:userId/subjects',    ctrl.getTeacherSubjects);
 // ═══════════════════════════════════════════════════════════════
 router.post('/',            authorize('admin', 'principal'), ctrl.create);
 router.post('/assignments', authorize('admin', 'principal'), ctrl.assignSubject);
+router.post('/bulk-import', authorize('admin', 'principal'), bulkImportCtrl.bulkImport);
+
 
 // ═══════════════════════════════════════════════════════════════
 // PUT — literal routes FIRST, dynamic :userId route LAST
