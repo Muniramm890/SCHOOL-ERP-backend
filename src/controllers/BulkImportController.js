@@ -1,21 +1,7 @@
 // src/controllers/BulkImportController.js
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/teachers/bulk-import   { dryRun: boolean, rows: [...] }
-//
-//   dryRun = true  → validate only, NOTHING is written. Returns per-row status,
-//                    subject plan (existing / restore / new) and a summary.
-//   dryRun = false → validate again (never trust the client) and import every
-//                    row that has no errors. One DB transaction per teacher, so
-//                    a bad row never blocks the others.
-//
-// Per teacher one transaction creates:
-//   users + school_members + staff_profiles
-//   + subjects (only if the name is new for this school; soft-deleted ones are restored)
-//   + subject_teachers   (teacher added INSIDE the school-level subject)
-//   + salary_structures  (optional)  + staff_bank_details (optional)
-//
-// Email / phone stay GLOBALLY unique (DB constraints) — duplicates are reported
-// as row errors. Existing endpoints (/teachers, /payroll, /setup) are untouched.
+
 // ─────────────────────────────────────────────────────────────────────────────
 const { query, withTransaction, sql } = require('../config/db');
 const { success, badRequest } = require('../utils/response');
@@ -599,6 +585,716 @@ exports.bulkImport = async (req, res, next) => {
     }, `${imported} of ${rows.length} imported`);
   } catch (err) { next(err); }
 };
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ███  STUDENTS BULK IMPORT  ███
+// POST /api/students/bulk-import   { dryRun: boolean, rows: [...] }
+//
+//   dryRun = true  → validate only, NOTHING is written (per-row status + plan).
+//   dryRun = false → validate again and import every row that is READY.
+//
+// Per student ONE transaction creates:
+//   students + enrolments (+ grade / section when they do not exist yet)
+//   + student_guardians (up to 2) + student_fee_accounts
+//   + (optional) ONE opening-balance invoice: category "Previous Dues" (legacy_due)
+//     and an optional extra-charge category (extra_fee_title / extra_fee_amount).
+//
+// Row status:  ok · warning (imports) · needs_input (admin must pick class /
+//              section / date of birth in the preview — NOT imported until fixed)
+//              · error (skipped).
+// Regular fee invoices are NOT generated here (Fees → Generate Invoices does that).
+// ═════════════════════════════════════════════════════════════════════════════
+const S_MAX_ROWS_DRY_RUN = 2000;
+const S_MAX_ROWS_COMMIT = 100;
+const PREVIOUS_DUES_NAME = 'Previous Dues';
+const DEFAULT_SECTION_NAME = 'A';
+const DEFAULT_SECTION_CAPACITY = 40;
+
+const istToday = () => new Date(Date.now() + 330 * 60000).toISOString().split('T')[0];
+
+// ── class / section name normalisation ───────────────────────────────────────
+const ROMAN = { i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10, xi: 11, xii: 12 };
+
+// "Class 5", "5th", "Grade-5", "V", "std 5" → "5" ; "Class 11 Science" → "11science"
+function gradeKey(name) {
+  let s = keyOf(name).replace(/[._\-–/]+/g, ' ');
+  s = s.replace(/\b(class|grade|std|standard|cls)\b/g, ' ').replace(/\s+/g, ' ').trim();
+  s = s.replace(/\b(\d{1,2})(st|nd|rd|th)\b/g, '$1');
+  const parts = s.split(' ').filter(Boolean);
+  if (parts.length && ROMAN[parts[0]]) parts[0] = String(ROMAN[parts[0]]);
+  const k = parts.join('');
+  return k || keyOf(name).replace(/\s+/g, '');
+}
+
+// Nursery < LKG < UKG < 1..12 < everything else (null → "append at the end")
+function deriveGradeOrder(name) {
+  const k = gradeKey(name);
+  if (k === 'nursery') return -3;
+  if (['lkg', 'kg1', 'juniorkg', 'jrkg'].includes(k)) return -2;
+  if (['ukg', 'kg2', 'seniorkg', 'srkg'].includes(k)) return -1;
+  const m = k.match(/^(\d{1,2})(?!\d)/);
+  if (m) { const n = Number(m[1]); if (n >= 1 && n <= 12) return n; }
+  return null;
+}
+
+const sectionKey = (n) => keyOf(n).replace(/^(section|sec)\s+/, '').replace(/\s+/g, '');
+
+const parseBool = (v) => ['1', 'y', 'yes', 'true', 'ews'].includes(str(v).toLowerCase());
+
+// ── row normalisation (pure, no DB) ──────────────────────────────────────────
+function normalizeStudentRow(raw, idx) {
+  const r = raw || {};
+  const errors = [];
+  const warnings = [];
+  const flags = [];
+  const needs = [];
+  const tooLong = (label, v, max) => { if (v && v.length > max) errors.push(`${label} too long (max ${max})`); };
+
+  // name
+  let first_name = normName(r.first_name);
+  let middle_name = normName(r.middle_name);
+  let last_name = normName(r.last_name);
+  if (!first_name && normName(r.full_name)) {
+    const t = normName(r.full_name).split(' ');
+    first_name = t[0];
+    if (t.length > 1) last_name = t[t.length - 1];
+    if (t.length > 2) middle_name = t.slice(1, -1).join(' ');
+  }
+  if (!first_name) errors.push('student name is required');
+  tooLong('first_name', first_name, 100); tooLong('middle_name', middle_name, 100); tooLong('last_name', last_name, 100);
+
+  const admission_no_given = str(r.admission_no);
+  tooLong('admission_no', admission_no_given, 100);
+
+  const g = normGender(r.gender);
+  if (g.unknown) warnings.push(`gender "${str(r.gender)}" not recognised — set to Male`);
+  else if (g.defaulted) warnings.push('gender blank — set to Male');
+
+  // date of birth: DB column is NOT NULL → admin must pick it in the preview
+  const today = istToday();
+  const dob = parseDate(r.date_of_birth);
+  let date_of_birth = dob.value;
+  if (!date_of_birth) {
+    needs.push('dob');
+    warnings.push(dob.bad ? 'Date of birth invalid — pick a date' : 'Date of birth missing — pick a date');
+  } else if (date_of_birth > today) {
+    date_of_birth = null; needs.push('dob'); warnings.push('Date of birth is in the future — pick a date');
+  } else {
+    const age = (new Date(today) - new Date(date_of_birth)) / (365.25 * 864e5);
+    if (age < 2 || age > 25) warnings.push(`Date of birth gives age ${Math.floor(age)} — please verify`);
+  }
+
+  const ad = parseDate(r.admission_date);
+  let admission_date = ad.value || today;
+  if (ad.bad) warnings.push('admission_date invalid — using today');
+
+  const class_name = normName(r.class_name);
+  const section_name = normName(r.section_name);
+  tooLong('class_name', class_name, 100); tooLong('section_name', section_name, 50);
+  if (!class_name) { needs.push('class'); warnings.push('Class missing — pick or type a class'); }
+
+  const roll_no = str(r.roll_no);
+  tooLong('roll_no', roll_no, 50);
+
+  const blood_group = str(r.blood_group).toUpperCase().replace(/\s/g, '') || null;
+  tooLong('blood_group', blood_group, 10);
+  const nationality = normName(r.nationality) || 'Indian';
+  const religion = normName(r.religion) || null;
+  const caste = normName(r.caste) || null;
+  const sub_caste = normName(r.sub_caste) || null;
+  tooLong('nationality', nationality, 100); tooLong('religion', religion, 100);
+  tooLong('caste', caste, 100); tooLong('sub_caste', sub_caste, 100);
+  const is_ews = parseBool(r.is_ews);
+
+  const aadhaar_no = str(r.aadhaar_no).replace(/[\s-]/g, '') || null;
+  tooLong('aadhaar_no', aadhaar_no, 20);
+  if (aadhaar_no && !/^\d{12}$/.test(aadhaar_no)) warnings.push('aadhaar_no is not 12 digits');
+  const previous_school = normName(r.previous_school) || null;
+  const tc_no = str(r.tc_no) || null;
+  tooLong('previous_school', previous_school, 255); tooLong('tc_no', tc_no, 100);
+
+  const clip = (v) => { const t = str(v); return t ? t.slice(0, 2000) : null; };
+  const address_permanent = clip(r.address_permanent);
+  const address_current = clip(r.address_current);
+  const medical_conditions = clip(r.medical_conditions);
+  const disabilities = clip(r.disabilities);
+  const city = normName(r.city) || null;
+  const state = normName(r.state) || null;
+  tooLong('city', city, 100); tooLong('state', state, 100);
+  let pincode = str(r.pincode) || null;
+  if (pincode && !/^\d{6}$/.test(pincode)) { warnings.push('pincode must be 6 digits — ignored'); pincode = null; }
+
+  // guardians (1 = primary). Name blank → guardian skipped (never junk rows).
+  const guardians = [];
+  for (const [p, primary] of [['guardian', true], ['guardian2', false]]) {
+    const name = normName(r[`${p}_name`]);
+    const relation = normName(r[`${p}_relation`]);
+    const phone = str(r[`${p}_phone`]).replace(/[\s\-()]/g, '');
+    const email = str(r[`${p}_email`]).toLowerCase();
+    if (!name) {
+      if (relation || phone || email) warnings.push(`${p} details ignored — name is blank`);
+      continue;
+    }
+    tooLong(`${p}_name`, name, 255); tooLong(`${p}_relation`, relation, 50); tooLong(`${p}_phone`, phone, 50);
+    if (!phone) warnings.push(`${p} phone missing`);
+    else if (!/^\+?\d{10,15}$/.test(phone)) warnings.push(`${p} phone looks unusual`);
+    let em = email || null;
+    if (em && (!EMAIL_RE.test(em) || em.length > 255)) { warnings.push(`${p} email not valid — ignored`); em = null; }
+    guardians.push({ full_name: name, relation: relation || 'Parent', phone, email: em, is_primary: primary });
+  }
+  if (guardians.length === 0) flags.push('no_guardian');
+
+  // fees: legacy due + optional extra charge (rupees → paise)
+  let legacy_paise = 0;
+  const ld = parseMoney(r.legacy_due);
+  if (Number.isNaN(ld)) errors.push('legacy_due must be a valid amount (max 2 decimals)');
+  else if (ld) legacy_paise = Math.round(ld * 100);
+  const legacy_remark = normName(r.legacy_due_remark) || null;
+  tooLong('legacy_due_remark', legacy_remark, 150);
+
+  let extra_paise = 0;
+  let extra_title = normName(r.extra_fee_title) || null;
+  const ex = parseMoney(r.extra_fee_amount);
+  if (Number.isNaN(ex)) errors.push('extra_fee_amount must be a valid amount (max 2 decimals)');
+  else if (ex) {
+    extra_paise = Math.round(ex * 100);
+    if (!extra_title) { extra_title = 'Other Charges'; warnings.push('extra_fee_title blank — using "Other Charges"'); }
+  } else if (extra_title) { warnings.push('extra_fee_title given without amount — ignored'); extra_title = null; }
+  tooLong('extra_fee_title', extra_title, 100);
+  if (legacy_paise || extra_paise) flags.push('has_dues');
+
+  return {
+    idx,
+    line: Number.isInteger(r.line) ? r.line : idx + 2,
+    first_name, middle_name: middle_name || null, last_name: last_name || null,
+    admission_no_given: admission_no_given || null,
+    gender: g.value, date_of_birth, admission_date,
+    class_name, section_name, roll_no_given: roll_no || null,
+    blood_group, nationality, religion, caste, sub_caste, is_ews, aadhaar_no, previous_school, tc_no,
+    address_permanent, address_current, city, state, pincode, medical_conditions, disabilities,
+    guardians,
+    fee: { legacy_paise, legacy_remark, extra_paise, extra_title },
+    errors, warnings, flags, needs,
+  };
+}
+
+// ── DB look-ups ──────────────────────────────────────────────────────────────
+async function loadStudentContext(schoolId) {
+  const sidP = { sid: { type: sql.UniqueIdentifier, value: schoolId } };
+  const ayRes = await query(
+    `SELECT TOP 1 id, name FROM academic_years WHERE school_id=@sid AND deleted_at IS NULL ORDER BY is_current DESC, created_at DESC`, sidP);
+  const ay = ayRes.recordset[0];
+  if (!ay) return null;
+  const ayP = { ...sidP, ay: { type: sql.UniqueIdentifier, value: ay.id } };
+
+  const [gr, se, en, ca] = await Promise.all([
+    query(`SELECT id, name, numeric_order, deleted_at FROM grades WHERE school_id=@sid`, sidP),
+    query(`SELECT id, grade_id, name, max_strength, deleted_at FROM sections WHERE school_id=@sid AND academic_year_id=@ay`, ayP),
+    query(`SELECT section_id, roll_no, is_active, deleted_at FROM enrolments WHERE school_id=@sid AND academic_year_id=@ay`, ayP),
+    query(`SELECT id, name FROM fee_categories WHERE school_id=@sid AND deleted_at IS NULL`, sidP),
+  ]);
+
+  const grades = gr.recordset.map((g) => ({
+    id: g.id, name: g.name, order: g.numeric_order, deleted: !!g.deleted_at, key: keyOf(g.name), gkey: gradeKey(g.name), sections: [],
+  }));
+  const byId = new Map(grades.map((g) => [g.id, g]));
+  for (const s of se.recordset) {
+    const g = byId.get(s.grade_id);
+    if (g) g.sections.push({ id: s.id, name: s.name, key: sectionKey(s.name), max: s.max_strength || DEFAULT_SECTION_CAPACITY, deleted: !!s.deleted_at });
+  }
+  const rolls = new Map(); const numericMax = new Map(); const activeCount = new Map();
+  for (const e of en.recordset) {
+    if (e.roll_no !== null && e.roll_no !== undefined) {
+      const rk = String(e.roll_no).trim().toLowerCase();
+      if (!rolls.has(e.section_id)) rolls.set(e.section_id, new Set());
+      rolls.get(e.section_id).add(rk);
+      if (/^\d+$/.test(rk)) numericMax.set(e.section_id, Math.max(numericMax.get(e.section_id) || 0, Number(rk)));
+    }
+    if (e.is_active && !e.deleted_at) activeCount.set(e.section_id, (activeCount.get(e.section_id) || 0) + 1);
+  }
+  const cats = new Map(ca.recordset.map((c) => [keyOf(c.name), { id: c.id, name: c.name }]));
+  const maxOrder = grades.reduce((m, g) => Math.max(m, g.order || 0), 0);
+
+  return {
+    ay, grades, rolls, numericMax, activeCount, cats, maxOrder,
+    // filled after each committed row so later rows in the same request reuse them
+    newGrades: new Map(), newSections: new Map(), newCats: new Map(), restoredGrades: new Set(), restoredSections: new Set(),
+  };
+}
+
+async function loadExistingAdmissionNos(schoolId, nos) {
+  const hit = new Set();
+  for (const part of chunk(nos, 400)) {
+    if (!part.length) continue;
+    const params = { sid: { type: sql.UniqueIdentifier, value: schoolId } };
+    part.forEach((n, i) => { params[`a${i}`] = { type: sql.NVarChar(100), value: n }; });
+    const r = await query(
+      `SELECT admission_no FROM students WHERE school_id=@sid AND deleted_at IS NULL AND admission_no IN (${part.map((_, i) => `@a${i}`).join(',')})`, params);
+    for (const row of r.recordset) hit.add(String(row.admission_no).toLowerCase());
+  }
+  return hit;
+}
+
+async function loadExistingInvoiceNos(schoolId, nos) {
+  const hit = new Set();
+  for (const part of chunk(nos, 400)) {
+    if (!part.length) continue;
+    const params = { sid: { type: sql.UniqueIdentifier, value: schoolId } };
+    part.forEach((n, i) => { params[`v${i}`] = { type: sql.NVarChar(100), value: n }; });
+    const r = await query(
+      `SELECT invoice_no FROM fee_invoices WHERE school_id=@sid AND invoice_no IN (${part.map((_, i) => `@v${i}`).join(',')})`, params);
+    for (const row of r.recordset) hit.add(String(row.invoice_no).toLowerCase());
+  }
+  return hit;
+}
+
+// ── grade resolution: exact name → normalised name → restore deleted → new ───
+function resolveGrade(ctx, name) {
+  const ek = keyOf(name);
+  const gk = gradeKey(name);
+  const live = ctx.grades.filter((g) => !g.deleted);
+  let m = live.filter((g) => g.key === ek);
+  if (m.length === 0) m = live.filter((g) => g.gkey === gk);
+  if (m.length === 1) return { action: 'existing', grade: m[0] };
+  if (m.length > 1) return { action: 'ambiguous', count: m.length };
+  const del = ctx.grades.filter((g) => g.deleted && (g.key === ek || g.gkey === gk));
+  if (del.length) return { action: 'restore', grade: del[0] };
+  return { action: 'new' };
+}
+
+// ── whole-batch validation + class/section/roll/admission/fee planning ───────
+async function validateStudentBatch(schoolId, rawRows) {
+  const ctx = await loadStudentContext(schoolId);
+  if (!ctx) return null;
+  const rows = rawRows.map((r, i) => normalizeStudentRow(r, i));
+
+  // ---- admission numbers ----
+  const seenAdm = new Map();
+  const given = [];
+  for (const r of rows) {
+    if (!r.admission_no_given) continue;
+    const k = r.admission_no_given.toLowerCase();
+    if (seenAdm.has(k)) r.errors.push(`duplicate admission_no in file (same as line ${seenAdm.get(k)})`);
+    else { seenAdm.set(k, r.line); given.push(r.admission_no_given); }
+  }
+  const admHit = await loadExistingAdmissionNos(schoolId, given);
+  for (const r of rows) {
+    if (r.admission_no_given && admHit.has(r.admission_no_given.toLowerCase())) r.errors.push('admission_no already exists in your school');
+  }
+
+  // ---- class / section plan (only rows that can still be imported take part) ----
+  const live = (r) => r.errors.length === 0;
+  const plannedOrder = new Map();
+  let otherOrder = Math.max(12, ctx.maxOrder);
+  const gradeInfo = new Map(); // identity -> { name, action, grade?, fileSections: Map(skey -> name) }
+  for (const r of rows) {
+    if (!live(r) || !r.class_name) continue;
+    const res = resolveGrade(ctx, r.class_name);
+    if (res.action === 'ambiguous') { r.errors.push(`class "${r.class_name}" matches ${res.count} classes — use the exact name`); continue; }
+    const identity = res.grade ? `id:${res.grade.id}` : `new:${gradeKey(r.class_name)}`;
+    r._gid = identity;
+    if (!gradeInfo.has(identity)) {
+      const info = { identity, name: res.grade ? res.grade.name : r.class_name, action: res.action, grade: res.grade || null, fileSections: new Map() };
+      if (res.action === 'new') {
+        let o = deriveGradeOrder(r.class_name);
+        if (o === null) o = ++otherOrder;
+        info.order = o;
+      } else info.order = res.grade.order;
+      gradeInfo.set(identity, info);
+    }
+    if (r.section_name) {
+      const sk = sectionKey(r.section_name);
+      if (!gradeInfo.get(identity).fileSections.has(sk)) gradeInfo.get(identity).fileSections.set(sk, r.section_name);
+    }
+  }
+
+  const sectionInfo = new Map(); // identity|skey -> { name, action, id?, max, rolls:Set, countExisting, assigned:0, nextRoll }
+  const getSection = (gi, skey, display) => {
+    const sid = `${gi.identity}|${skey}`;
+    if (sectionInfo.has(sid)) return sectionInfo.get(sid);
+    const ex = gi.grade ? gi.grade.sections.find((s) => s.key === skey && !s.deleted) : null;
+    const del = !ex && gi.grade ? gi.grade.sections.find((s) => s.key === skey && s.deleted) : null;
+    const base = ex || del;
+    const info = {
+      sid, identity: gi.identity, skey,
+      name: base ? base.name : display,
+      action: ex ? 'existing' : del ? 'restore' : 'new',
+      id: base ? base.id : null,
+      max: base ? base.max : DEFAULT_SECTION_CAPACITY,
+      rolls: new Set(base ? (ctx.rolls.get(base.id) || []) : []),
+      numericMax: base ? (ctx.numericMax.get(base.id) || 0) : 0,
+      existingCount: base && !base.deleted ? (ctx.activeCount.get(base.id) || 0) : 0,
+      assigned: 0,
+    };
+    sectionInfo.set(sid, info);
+    return info;
+  };
+
+  for (const r of rows) {
+    if (!live(r) || !r._gid) continue;
+    const gi = gradeInfo.get(r._gid);
+    const liveExisting = gi.grade ? gi.grade.sections.filter((s) => !s.deleted) : [];
+    const options = new Map(); // skey -> display
+    liveExisting.forEach((s) => options.set(s.key, s.name));
+    gi.fileSections.forEach((disp, k) => { if (!options.has(k)) options.set(k, disp); });
+    let how = 'named'; let skey; let display;
+    if (r.section_name) { skey = sectionKey(r.section_name); display = options.get(skey) || r.section_name; }
+    else if (options.size === 0) { skey = sectionKey(DEFAULT_SECTION_NAME); display = DEFAULT_SECTION_NAME; how = 'default'; }
+    else if (options.size === 1) { [skey, display] = [...options.entries()][0]; how = 'only_section'; }
+    else {
+      r.needs.push('section');
+      r.section_options = [...options.values()].sort((a, b) => a.localeCompare(b));
+      r.warnings.push('Class has several sections — choose one (or type a new one)');
+      continue;
+    }
+    const sec = getSection(gi, skey, display);
+    r._sec = sec;
+    r.plan = {
+      grade: { name: gi.name, action: gi.action, order: gi.order, id: gi.grade ? gi.grade.id : null, identity: gi.identity },
+      section: { name: sec.name, action: sec.action, id: sec.id, how, identity: sec.sid },
+    };
+  }
+
+  // ---- roll numbers (explicit first, then auto) — only rows that will really import ----
+  const importable = (r) => r.errors.length === 0 && r.needs.length === 0 && r._sec;
+  const rollSeen = new Map();
+  for (const r of rows) {
+    if (!importable(r) || !r.roll_no_given) continue;
+    const k = `${r._sec.sid}|${r.roll_no_given.toLowerCase()}`;
+    if (rollSeen.has(k)) { r.errors.push(`roll no ${r.roll_no_given} repeated in this section (line ${rollSeen.get(k)})`); continue; }
+    if (r._sec.rolls.has(r.roll_no_given.toLowerCase())) { r.errors.push(`roll no ${r.roll_no_given} is already used in this section`); continue; }
+    rollSeen.set(k, r.line);
+    r._sec.rolls.add(r.roll_no_given.toLowerCase());
+    if (/^\d+$/.test(r.roll_no_given)) r._sec.numericMax = Math.max(r._sec.numericMax, Number(r.roll_no_given));
+  }
+  for (const r of rows) {
+    if (!importable(r)) continue;
+    if (r.roll_no_given) { r.roll_no = r.roll_no_given; }
+    else {
+      let n = r._sec.numericMax + 1;
+      while (r._sec.rolls.has(String(n))) n += 1;
+      r._sec.numericMax = n; r._sec.rolls.add(String(n));
+      r.roll_no = String(n); r.flags.push('roll_auto');
+    }
+    r._sec.assigned += 1;
+  }
+
+  // ---- capacity warnings (not enforced anywhere today → warning only) ----
+  for (const r of rows) {
+    if (!importable(r)) continue;
+    const total = r._sec.existingCount + r._sec.assigned;
+    if (total > r._sec.max) { r.warnings.push(`Section ${r._sec.name} will have ${total} students (capacity ${r._sec.max})`); r.flags.push('over_capacity'); }
+  }
+
+  // ---- admission numbers: auto for blanks ----
+  const year = istToday().slice(0, 4);
+  const prefix = `ADM-${year}-`;
+  const needAuto = rows.filter((r) => importable(r) && !r.admission_no_given);
+  if (needAuto.length) {
+    const pr = await query(
+      `SELECT admission_no FROM students WHERE school_id=@sid AND deleted_at IS NULL AND admission_no LIKE @pfx`,
+      { sid: { type: sql.UniqueIdentifier, value: schoolId }, pfx: { type: sql.NVarChar(100), value: `${prefix}%` } });
+    let max = 0;
+    for (const x of pr.recordset) { const m = String(x.admission_no).match(/(\d+)$/); if (m) max = Math.max(max, Number(m[1])); }
+    const used = new Set(seenAdm.keys());
+    let n = max;
+    for (const r of needAuto) {
+      let cand;
+      do { n += 1; cand = `${prefix}${String(n).padStart(4, '0')}`; } while (used.has(cand.toLowerCase()));
+      used.add(cand.toLowerCase());
+      r.admission_no = cand; r.flags.push('admission_auto');
+    }
+  }
+  for (const r of rows) if (r.admission_no_given) r.admission_no = r.admission_no_given;
+
+  // ---- fee plan: categories + invoice numbers ----
+  const catPlan = new Map(); // key -> { name, action, id }
+  const planCat = (name) => {
+    const k = keyOf(name);
+    if (catPlan.has(k)) return catPlan.get(k);
+    const ex = ctx.cats.get(k);
+    const p = { key: k, name: ex ? ex.name : name, action: ex ? 'existing' : 'new', id: ex ? ex.id : null };
+    catPlan.set(k, p);
+    return p;
+  };
+  const dueRows = rows.filter((r) => importable(r) && (r.fee.legacy_paise || r.fee.extra_paise));
+  if (dueRows.length) {
+    const candidates = dueRows.map((r) => `OPB-${(r.admission_no || '').slice(0, 90)}`);
+    const taken = await loadExistingInvoiceNos(schoolId, candidates);
+    for (const r of dueRows) {
+      let no = `OPB-${r.admission_no.slice(0, 90)}`; let n = 1;
+      while (taken.has(no.toLowerCase())) { n += 1; no = `OPB-${r.admission_no.slice(0, 90)}-${n}`; }
+      taken.add(no.toLowerCase());
+      r.fee.invoice_no = no;
+      if (r.fee.legacy_paise) r.fee.legacy_cat = planCat(PREVIOUS_DUES_NAME);
+      if (r.fee.extra_paise) r.fee.extra_cat = planCat(r.fee.extra_title);
+    }
+  }
+
+  // ---- summary (counts only rows that will really be imported) ----
+  const ready = rows.filter(importable);
+  const gSum = new Map(); const sSum = new Map();
+  for (const r of ready) {
+    const g = r.plan.grade; const s = r.plan.section;
+    const gs = gSum.get(g.identity) || { name: g.name, action: g.action, order: g.order, students: 0 };
+    gs.students += 1; gSum.set(g.identity, gs);
+    const ss = sSum.get(s.identity) || { class_name: g.name, name: s.name, action: s.action, how: s.how, students: 0, max: sectionInfo.get(s.identity).max, total: 0 };
+    ss.students += 1; ss.total = sectionInfo.get(s.identity).existingCount + sectionInfo.get(s.identity).assigned; sSum.set(s.identity, ss);
+  }
+  const sumPaise = (f) => ready.reduce((t, r) => t + (r.fee[f] || 0), 0);
+  const summary = {
+    total: rows.length,
+    ok: rows.filter((r) => !r.errors.length && !r.needs.length && !r.warnings.length).length,
+    warning: rows.filter((r) => !r.errors.length && !r.needs.length && r.warnings.length).length,
+    needs_input: rows.filter((r) => !r.errors.length && r.needs.length).length,
+    error: rows.filter((r) => r.errors.length).length,
+    ready: ready.length,
+    needs_class: rows.filter((r) => !r.errors.length && r.needs.includes('class')).length,
+    needs_section: rows.filter((r) => !r.errors.length && r.needs.includes('section')).length,
+    needs_dob: rows.filter((r) => !r.errors.length && r.needs.includes('dob')).length,
+    classes_existing: [...gSum.values()].filter((g) => g.action === 'existing').map((g) => ({ name: g.name, students: g.students })),
+    classes_restore: [...gSum.values()].filter((g) => g.action === 'restore').map((g) => ({ name: g.name, students: g.students })),
+    classes_new: [...gSum.values()].filter((g) => g.action === 'new').map((g) => ({ name: g.name, students: g.students, numeric_order: g.order })),
+    sections: [...sSum.values()],
+    sections_new: [...sSum.values()].filter((s) => s.action !== 'existing').length,
+    over_capacity: [...sSum.values()].filter((s) => s.total > s.max).map((s) => ({ class_name: s.class_name, name: s.name, total: s.total, max: s.max })),
+    legacy: { students: ready.filter((r) => r.fee.legacy_paise).length, total_paise: sumPaise('legacy_paise') },
+    extra: { students: ready.filter((r) => r.fee.extra_paise).length, total_paise: sumPaise('extra_paise') },
+    categories_new: [...catPlan.values()].filter((c) => c.action === 'new').map((c) => c.name),
+    admission_auto: ready.filter((r) => r.flags.includes('admission_auto')).length,
+    roll_auto: ready.filter((r) => r.flags.includes('roll_auto')).length,
+    no_guardian: ready.filter((r) => r.flags.includes('no_guardian')).length,
+  };
+
+  const available_classes = ctx.grades.filter((g) => !g.deleted)
+    .sort((a, b) => (a.order ?? 999) - (b.order ?? 999) || a.name.localeCompare(b.name))
+    .map((g) => ({ id: g.id, name: g.name, sections: g.sections.filter((s) => !s.deleted).map((s) => s.name).sort() }));
+
+  return { ctx, rows, summary, available_classes, catPlan };
+}
+
+const studentRowStatus = (r) => (r.errors.length ? 'error' : r.needs.length ? 'needs_input' : r.warnings.length ? 'warning' : 'ok');
+const studentPublicRow = (r) => ({
+  idx: r.idx, line: r.line, status: studentRowStatus(r),
+  errors: r.errors, warnings: r.warnings, flags: r.flags, needs: r.needs,
+  section_options: r.section_options || null,
+  plan: r.plan || null,
+  admission_no: r.admission_no || null,
+  roll_no: r.roll_no || null,
+  fee: { legacy_paise: r.fee.legacy_paise, extra_paise: r.fee.extra_paise, extra_title: r.fee.extra_title },
+});
+
+// ── write one student (one transaction) ──────────────────────────────────────
+async function importOneStudent(schoolId, adminUserId, r, ctx) {
+  const studentId = uuidv4();
+  const pend = { grades: [], sections: [], cats: [], restoredGrades: [], restoredSections: [] };
+  let invoiceCreated = false;
+
+  await withTransaction(async (tx) => {
+    // 1. class (grade)
+    const gp = r.plan.grade;
+    let gradeId = gp.id || ctx.newGrades.get(gp.identity) || null;
+    if (!gradeId) {
+      gradeId = uuidv4();
+      const q = tx.request();
+      q.input('id', sql.UniqueIdentifier, gradeId); q.input('sid', sql.UniqueIdentifier, schoolId);
+      q.input('name', sql.NVarChar(100), gp.name); q.input('ord', sql.SmallInt, gp.order);
+      await q.query(`INSERT INTO grades (id, school_id, name, numeric_order, stream) VALUES (@id, @sid, @name, @ord, 'none')`);
+      pend.grades.push([gp.identity, gradeId]);
+    } else if (gp.action === 'restore' && !ctx.restoredGrades.has(gradeId)) {
+      const q = tx.request();
+      q.input('id', sql.UniqueIdentifier, gradeId); q.input('sid', sql.UniqueIdentifier, schoolId);
+      await q.query(`UPDATE grades SET deleted_at=NULL, is_active=1, updated_at=GETUTCDATE() WHERE id=@id AND school_id=@sid`);
+      pend.restoredGrades.push(gradeId);
+    }
+
+    // 2. section (current academic year)
+    const sp = r.plan.section;
+    let sectionId = sp.id || ctx.newSections.get(sp.identity) || null;
+    if (!sectionId) {
+      sectionId = uuidv4();
+      const q = tx.request();
+      q.input('id', sql.UniqueIdentifier, sectionId); q.input('sid', sql.UniqueIdentifier, schoolId);
+      q.input('gid', sql.UniqueIdentifier, gradeId); q.input('ay', sql.UniqueIdentifier, ctx.ay.id);
+      q.input('name', sql.NVarChar(50), sp.name);
+      await q.query(`INSERT INTO sections (id, school_id, grade_id, academic_year_id, name) VALUES (@id, @sid, @gid, @ay, @name)`);
+      pend.sections.push([sp.identity, sectionId]);
+    } else if (sp.action === 'restore' && !ctx.restoredSections.has(sectionId)) {
+      const q = tx.request();
+      q.input('id', sql.UniqueIdentifier, sectionId); q.input('sid', sql.UniqueIdentifier, schoolId);
+      await q.query(`UPDATE sections SET deleted_at=NULL, is_active=1, updated_at=GETUTCDATE() WHERE id=@id AND school_id=@sid`);
+      pend.restoredSections.push(sectionId);
+    }
+
+    // 3. student
+    const s1 = tx.request();
+    s1.input('id', sql.UniqueIdentifier, studentId); s1.input('sid', sql.UniqueIdentifier, schoolId);
+    s1.input('adm', sql.NVarChar(100), r.admission_no); s1.input('fn', sql.NVarChar(100), r.first_name);
+    s1.input('mn', sql.NVarChar(100), r.middle_name); s1.input('ln', sql.NVarChar(100), r.last_name);
+    s1.input('gen', sql.VarChar(20), r.gender); s1.input('dob', sql.Date, r.date_of_birth);
+    s1.input('bg', sql.VarChar(10), r.blood_group); s1.input('nat', sql.NVarChar(100), r.nationality);
+    s1.input('rel', sql.NVarChar(100), r.religion); s1.input('caste', sql.NVarChar(100), r.caste);
+    s1.input('sc', sql.NVarChar(100), r.sub_caste); s1.input('ews', sql.Bit, r.is_ews ? 1 : 0);
+    s1.input('aad', sql.NVarChar(20), r.aadhaar_no); s1.input('ps', sql.NVarChar(255), r.previous_school);
+    s1.input('tc', sql.NVarChar(100), r.tc_no); s1.input('ad', sql.Date, r.admission_date);
+    s1.input('ap', sql.NVarChar(sql.MAX), r.address_permanent); s1.input('ac', sql.NVarChar(sql.MAX), r.address_current);
+    s1.input('city', sql.NVarChar(100), r.city); s1.input('state', sql.NVarChar(100), r.state);
+    s1.input('pin', sql.Char(6), r.pincode); s1.input('med', sql.NVarChar(sql.MAX), r.medical_conditions);
+    s1.input('dis', sql.NVarChar(sql.MAX), r.disabilities);
+    await s1.query(`INSERT INTO students (id,school_id,admission_no,first_name,middle_name,last_name,gender,date_of_birth,blood_group,nationality,religion,caste,sub_caste,is_ews,aadhaar_no,previous_school,tc_no,admission_date,address_permanent,address_current,city,state,pincode,medical_conditions,disabilities)
+      VALUES (@id,@sid,@adm,@fn,@mn,@ln,@gen,@dob,@bg,@nat,@rel,@caste,@sc,@ews,@aad,@ps,@tc,@ad,@ap,@ac,@city,@state,@pin,@med,@dis)`);
+
+    // 4. enrolment
+    const e1 = tx.request();
+    e1.input('sid', sql.UniqueIdentifier, schoolId); e1.input('st', sql.UniqueIdentifier, studentId);
+    e1.input('sec', sql.UniqueIdentifier, sectionId); e1.input('ay', sql.UniqueIdentifier, ctx.ay.id);
+    e1.input('roll', sql.NVarChar(50), r.roll_no);
+    await e1.query(`INSERT INTO enrolments (id,school_id,student_id,section_id,academic_year_id,roll_no,is_active) VALUES (NEWID(),@sid,@st,@sec,@ay,@roll,1)`);
+
+    // 5. guardians
+    for (const g of r.guardians) {
+      const q = tx.request();
+      q.input('sid', sql.UniqueIdentifier, schoolId); q.input('st', sql.UniqueIdentifier, studentId);
+      q.input('rel', sql.NVarChar(50), g.relation); q.input('fn', sql.NVarChar(255), g.full_name);
+      q.input('ph', sql.NVarChar(50), g.phone); q.input('em', sql.NVarChar(255), g.email);
+      q.input('pri', sql.Bit, g.is_primary ? 1 : 0);
+      await q.query(`INSERT INTO student_guardians (id,school_id,student_id,relation,full_name,phone,email,is_primary) VALUES (NEWID(),@sid,@st,@rel,@fn,@ph,@em,@pri)`);
+    }
+
+    // 6. opening balance invoice (legacy due + extra) + fee account
+    const total = r.fee.legacy_paise + r.fee.extra_paise;
+    const items = [];
+    const catId = async (plan, name) => {
+      let id = plan.id || ctx.newCats.get(plan.key);
+      if (!id) {
+        id = uuidv4();
+        const q = tx.request();
+        q.input('id', sql.UniqueIdentifier, id); q.input('sid', sql.UniqueIdentifier, schoolId); q.input('name', sql.NVarChar(100), name);
+        await q.query(`INSERT INTO fee_categories (id, school_id, name, is_recurring) VALUES (@id, @sid, @name, 0)`);
+        pend.cats.push([plan.key, id]);
+      }
+      return id;
+    };
+    if (r.fee.legacy_paise) items.push({ cat: await catId(r.fee.legacy_cat, PREVIOUS_DUES_NAME), amt: r.fee.legacy_paise });
+    if (r.fee.extra_paise) items.push({ cat: await catId(r.fee.extra_cat, r.fee.extra_title), amt: r.fee.extra_paise });
+
+    if (total > 0) {
+      const invId = uuidv4();
+      const title = r.fee.legacy_remark ? `Opening Balance – ${r.fee.legacy_remark}` : 'Opening Balance';
+      const iq = tx.request();
+      iq.input('id', sql.UniqueIdentifier, invId); iq.input('sid', sql.UniqueIdentifier, schoolId);
+      iq.input('st', sql.UniqueIdentifier, studentId); iq.input('ay', sql.UniqueIdentifier, ctx.ay.id);
+      iq.input('no', sql.NVarChar(100), r.fee.invoice_no); iq.input('title', sql.NVarChar(255), title);
+      iq.input('due', sql.Date, istToday()); iq.input('total', sql.BigInt, total);
+      iq.input('cby', sql.UniqueIdentifier, adminUserId);
+      await iq.query(`INSERT INTO fee_invoices (id, school_id, student_id, academic_year_id, invoice_no, title, due_date, total_paise, balance_paise, status, created_by)
+        VALUES (@id,@sid,@st,@ay,@no,@title,@due,@total,@total,'pending',@cby)`);
+      for (const it of items) {
+        const q = tx.request();
+        q.input('iid', sql.UniqueIdentifier, invId); q.input('cid', sql.UniqueIdentifier, it.cat); q.input('amt', sql.BigInt, it.amt);
+        await q.query(`INSERT INTO fee_invoice_items (id, invoice_id, fee_category_id, amount_paise) VALUES (NEWID(),@iid,@cid,@amt)`);
+      }
+      invoiceCreated = true;
+    }
+    const fa = tx.request();
+    fa.input('sid', sql.UniqueIdentifier, schoolId); fa.input('st', sql.UniqueIdentifier, studentId);
+    fa.input('total', sql.BigInt, total); fa.input('status', sql.VarChar(20), total > 0 ? 'pending' : 'Pending');
+    await fa.query(`INSERT INTO student_fee_accounts (id,school_id,student_id,total_fee_paise,paid_paise,pending_paise,status) VALUES (NEWID(),@sid,@st,@total,0,@total,@status)`);
+  });
+
+  // committed → safe to share what this row created with the following rows
+  for (const [k, id] of pend.grades) ctx.newGrades.set(k, id);
+  for (const [k, id] of pend.sections) ctx.newSections.set(k, id);
+  for (const [k, id] of pend.cats) ctx.newCats.set(k, id);
+  pend.restoredGrades.forEach((id) => ctx.restoredGrades.add(id));
+  pend.restoredSections.forEach((id) => ctx.restoredSections.add(id));
+  return {
+    student_id: studentId,
+    created_grade: pend.grades.length ? r.plan.grade.name : null,
+    created_section: pend.sections.length ? `${r.plan.grade.name} – ${r.plan.section.name}` : null,
+    restored: pend.restoredGrades.length + pend.restoredSections.length,
+    created_cats: pend.cats.length,
+    invoice: invoiceCreated,
+  };
+}
+
+function friendlyStudentDbError(err) {
+  const m = String(err && err.message || '');
+  if (err && (err.number === 2627 || err.number === 2601)) {
+    if (/rollno|roll/i.test(m)) return 'roll number already used in this section';
+    if (/invoice/i.test(m)) return 'invoice number conflict — please retry this row';
+    return 'duplicate record';
+  }
+  return m || 'Database error';
+}
+
+exports.bulkImportStudents = async (req, res, next) => {
+  try {
+    const { schoolId } = req.user;
+    const adminUserId = req.user.userId || req.user.id;
+    const { dryRun = true, rows: rawRows } = req.body || {};
+
+    if (!Array.isArray(rawRows) || rawRows.length === 0) return badRequest(res, 'rows[] is required');
+    const limit = dryRun ? S_MAX_ROWS_DRY_RUN : S_MAX_ROWS_COMMIT;
+    if (rawRows.length > limit) return badRequest(res, `Max ${limit} rows per ${dryRun ? 'preview' : 'import'} request`);
+
+    const v = await validateStudentBatch(schoolId, rawRows);
+    if (!v) return badRequest(res, 'No academic year found for your school. Create one in Setup first.');
+    const { ctx, rows, summary, available_classes } = v;
+
+    if (dryRun) {
+      return success(res, {
+        academic_year: ctx.ay.name,
+        summary,
+        rows: rows.map(studentPublicRow),
+        available_classes,
+      }, 'Preview ready');
+    }
+
+    const results = [];
+    const agg = { imported: 0, classes: new Set(), sections: new Set(), invoices: 0, legacy_paise: 0, extra_paise: 0 };
+    for (const r of rows) {
+      if (r.errors.length || r.needs.length) {
+        const why = r.errors.length ? r.errors.join('; ')
+          : `Needs input: ${r.needs.map((n) => ({ class: 'class', section: 'section', dob: 'date of birth' }[n])).join(', ')}`;
+        results.push({ idx: r.idx, line: r.line, ok: false, error: why });
+        continue;
+      }
+      try {
+        const out = await importOneStudent(schoolId, adminUserId, r, ctx);
+        agg.imported += 1;
+        if (out.created_grade) agg.classes.add(out.created_grade);
+        if (out.created_section) agg.sections.add(out.created_section);
+        if (out.invoice) { agg.invoices += 1; agg.legacy_paise += r.fee.legacy_paise; agg.extra_paise += r.fee.extra_paise; }
+        results.push({ idx: r.idx, line: r.line, ok: true, student_id: out.student_id, admission_no: r.admission_no, warnings: r.warnings });
+      } catch (e) {
+        results.push({ idx: r.idx, line: r.line, ok: false, error: friendlyStudentDbError(e) });
+      }
+    }
+
+    try {
+      await query(
+        `INSERT INTO audit_logs (id, school_id, user_id, action_type, details, created_at) VALUES (@lid, @sid, @uid, 'STUDENTS_BULK_IMPORT', @det, GETUTCDATE())`,
+        {
+          lid: { type: sql.UniqueIdentifier, value: uuidv4() },
+          sid: { type: sql.UniqueIdentifier, value: schoolId },
+          uid: { type: sql.UniqueIdentifier, value: adminUserId },
+          det: { type: sql.NVarChar(sql.MAX), value: JSON.stringify({ imported: agg.imported, failed: rows.length - agg.imported, classesCreated: [...agg.classes], sectionsCreated: [...agg.sections], legacyDuePaise: agg.legacy_paise }) },
+        });
+    } catch (logErr) { console.warn('Student bulk import audit log failed:', logErr.message); }
+
+    return success(res, {
+      summary: {
+        total: rows.length, imported: agg.imported, failed: rows.length - agg.imported,
+        classes_created: [...agg.classes], sections_created: [...agg.sections],
+        invoices: agg.invoices, legacy_paise: agg.legacy_paise, extra_paise: agg.extra_paise,
+      },
+      results,
+    }, `${agg.imported} of ${rows.length} imported`);
+  } catch (err) { next(err); }
+};
+
+exports._studentInternal = { normalizeStudentRow, gradeKey, deriveGradeOrder, sectionKey };
 
 // exposed for unit tests only
 exports._internal = { normalizeRow, parseDate, parseMoney, parseSubjects, findSimilarSubject, normGender };
