@@ -2,6 +2,7 @@
 const router = require('express').Router();
 const ctrl   = require('../controllers/studentsController');
 const promotionCtrl = require('../controllers/promotionController');
+const bulkImportCtrl = require('../controllers/BulkImportController');
 const { authenticate, authorize } = require('../middleware/auth');
 
 router.use(authenticate);
@@ -9,6 +10,10 @@ router.use(authenticate);
 // List + create
 router.get('/',     ctrl.list);
 router.post('/',    authorize('admin', 'principal'), ctrl.create);
+// Bulk import (students + classes/sections + legacy dues)
+router.post('/bulk-import', authorize('admin', 'principal'), bulkImportCtrl.bulkImportStudents);
+
+
 
 // Single student
 router.get('/:id',    ctrl.getOne);
