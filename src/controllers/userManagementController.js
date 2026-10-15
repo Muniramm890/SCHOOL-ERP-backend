@@ -375,8 +375,8 @@ exports.updatePermissions = async (req, res, next) => {
       res,
       { modules, ignored },
       ignored.length
-        ? `Permissions updated. Unknown modules ignored: ${ignored.join(', ')}. User ko naye modules page refresh/next login par dikhenge.`
-        : "Permissions updated. User ko naye modules page refresh/next login par dikhenge."
+        ? `Permissions updated. Unknown modules ignored: ${ignored.join(', ')}. The user will see the changes after refreshing the page or logging in again.`
+        : "Permissions updated. The user will see the changes after refreshing the page or logging in again."
     );
   } catch (err) { next(err); }
 };
