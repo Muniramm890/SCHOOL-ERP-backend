@@ -9,7 +9,7 @@ const rateLimit  = require('express-rate-limit');
 const { getPool, poolPromise } = require('./config/db');
 const logger     = require('./utils/logger');
 const errorHandler = require('./middleware/errorHandler');
-const { authenticate } = require('./middleware/auth');
+const { moduleGate } = require('./middleware/auth');
 const requestLogger = require('./middleware/requestLogger');
 
 
@@ -82,27 +82,32 @@ app.get('/health', (req, res) => {
 const API = '/api';
 
 app.use(`${API}/auth`,          require('./routes/auth'));
-app.use(`${API}/dashboard`,     require('./routes/dashboard'));
-app.use(`${API}/setup`,         require('./routes/setup'));
-app.use(`${API}/students`,      require('./routes/students'));
-app.use(`${API}/promotion`,     require('./routes/promotion'));
-app.use(`${API}/teachers`,      require('./routes/teachers'));
-app.use(`${API}/fees`,          require('./routes/fees'));
-app.use(`${API}/payroll`,       require('./routes/payroll'));
-app.use(`${API}/arrangement`,   require('./routes/arrangement'));
-app.use('/api/payments', require('./routes/payments'));
-app.use(`${API}/results`,       require('./routes/results'));
-app.use(`${API}/timetable`,    require('./routes/timetables'));
-app.use(`${API}/quick-tests`,   require('./routes/quickTests'));
-app.use(`${API}/exams`,         require('./routes/exams'));
+
+// ── Module-wise access (User Management > Permissions) ──────────────────────
+// moduleGate(keys, rules): school_admin ko sab; baaki ko school_members.permissions.modules me se koi ek key chahiye.
+// 'open'  = doosre modules ke shared lookups (koi bhi authenticated staff padh sakta hai); writes module permission maangte hain.
+// Fine-grained role checks (authorize(...)) route files ke andar waise hi chalte hain.
+app.use(`${API}/dashboard`,     moduleGate('dashboard'),                                   require('./routes/dashboard'));
+app.use(`${API}/setup`,         moduleGate('setup',    { 'GET *': 'open' }),               require('./routes/setup'));
+app.use(`${API}/students`,      moduleGate('students', { 'GET *': 'open' }),               require('./routes/students'));
+app.use(`${API}/promotion`,     moduleGate('promotion'),                                   require('./routes/promotion'));
+app.use(`${API}/teachers`,      moduleGate('teachers', { 'GET *': 'open' }),               require('./routes/teachers'));
+app.use(`${API}/fees`,          moduleGate('fees',     { 'GET /overview': ['fees', 'dashboard'] }), require('./routes/fees'));
+app.use(`${API}/payroll`,       moduleGate('payroll'),                                     require('./routes/payroll'));
+app.use(`${API}/arrangement`,   moduleGate('arrangement'),                                 require('./routes/arrangement'));
+app.use('/api/payments',        moduleGate('fees'),                                        require('./routes/payments'));
+app.use(`${API}/results`,       moduleGate(['results', 'exams']),                          require('./routes/results'));
+app.use(`${API}/timetable`,     moduleGate(['timetable', 'setup', 'teachers']),            require('./routes/timetables'));
+app.use(`${API}/quick-tests`,   moduleGate('tests'),                                       require('./routes/quickTests'));
+app.use(`${API}/exams`,         moduleGate(['exams', 'results']),                          require('./routes/exams'));
 app.use(`${API}/notices`,       require('./routes/notices'));
 app.use(`${API}/notifications`, require('./routes/notifications'));
-app.use(`${API}/comm`, require('./routes/commHub'));
-app.use(`${API}/homework`,      require('./routes/homework'));
-app.use('/api/attendance',authenticate,   require('./routes/attendance'));
+app.use(`${API}/comm`,          moduleGate('commhub',  { 'GET /messages/:id': 'open' }),   require('./routes/commHub'));
+app.use(`${API}/homework`,      moduleGate('homework', { 'GET /mine': 'skip' }),           require('./routes/homework'));
+app.use('/api/attendance',      moduleGate('attendance', { 'GET /staff/roster': ['attendance', 'dashboard'] }), require('./routes/attendance'));
 app.use(`${API}/audit`, require('./routes/audit'));
 app.use(`${API}/admin/users`, require('./routes/userManagement'));
-app.use(`${API}/transport`, require('./routes/transport'));
+app.use(`${API}/transport`,     moduleGate('transport'),                                   require('./routes/transport'));
 
 // ── Student App routes (isolated auth, existing controllers reused) ──────
 app.use(`${API}/student/auth`,        require('./routes/student/Auth'));
