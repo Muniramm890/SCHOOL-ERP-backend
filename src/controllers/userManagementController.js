@@ -332,13 +332,25 @@ exports.updateRole = async (req, res, next) => {
 // ── PUT /api/admin/users/:memberId/permissions ──────────────────────────
 // Module-wise access — existing permissions JSON column reuse karta hai:
 // { "modules": ["students", "fees", "attendance"] }
+// Assignable module keys (frontend sidebar / User Management ke saath same rakhein).
+// usermanagement + auditlogs yaha nahi — wo sirf school_admin ke liye hain.
+const VALID_MODULES = [
+  'dashboard', 'attendance', 'homework', 'tests', 'timetable', 'arrangement', 'exams', 'results',
+  'leaderboard', 'analytics', 'students', 'commhub', 'teachers', 'fees', 'payroll', 'transport',
+  'promotion', 'setup',
+];
+
 exports.updatePermissions = async (req, res, next) => {
   try {
     const { schoolId, userId: actingUserId, fullName: actingUserName } = req.user;
     const { memberId } = req.params;
-    const { modules } = req.body;
+    const { modules: rawModules } = req.body;
 
-    if (!Array.isArray(modules)) return badRequest(res, 'modules must be an array of module keys');
+    if (!Array.isArray(rawModules)) return badRequest(res, 'modules must be an array of module keys');
+
+    // Sirf known keys save hote hain (duplicates hata dete hain); unknown keys ignore + response me batate hain
+    const modules = [...new Set(rawModules)].filter((m) => VALID_MODULES.includes(m));
+    const ignored = [...new Set(rawModules)].filter((m) => !VALID_MODULES.includes(m));
 
     const target = await queryOne(
       `SELECT sm.id, sm.user_id, u.full_name FROM school_members sm JOIN users u ON u.id = sm.user_id
@@ -359,7 +371,13 @@ exports.updatePermissions = async (req, res, next) => {
       details: { targetUserId: target.user_id, targetName: target.full_name, modules },
     });
 
-    return success(res, null, "Permissions updated. Changes apply on the user's next login.");
+    return success(
+      res,
+      { modules, ignored },
+      ignored.length
+        ? `Permissions updated. Unknown modules ignored: ${ignored.join(', ')}. User ko naye modules page refresh/next login par dikhenge.`
+        : "Permissions updated. User ko naye modules page refresh/next login par dikhenge."
+    );
   } catch (err) { next(err); }
 };
 

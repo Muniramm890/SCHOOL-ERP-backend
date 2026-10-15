@@ -3,7 +3,9 @@ const router = require('express').Router();
 const ctrl = require('../controllers/payrollController');
 const { authenticate, authorize } = require('../middleware/auth');
 
-router.use(authenticate, authorize('admin', 'principal'));
+// [module-permissions] pehle: router.use(authenticate, authorize('admin', 'principal')) — role names 'admin'/'principal' exist nahi karte the,
+// isse module sirf school_admin tak limited tha. Ab access server.js ke moduleGate (User Management permission) se control hota hai.
+router.use(authenticate);
 
 router.get('/leave-types', ctrl.listLeaveTypes);
 router.post('/leave-types', ctrl.createLeaveType);

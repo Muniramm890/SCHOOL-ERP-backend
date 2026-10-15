@@ -5,6 +5,8 @@ const { queryOne, sql } = require('../config/db');
 
 // Verify JWT and attach user context
 const authenticate = async (req, res, next) => {
+  // moduleGate() pehle hi authenticate kar chuka ho to dobara DB lookup nahi (route files me bhi router.use(authenticate) hai)
+  if (req._staffAuthed) return next();
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -45,6 +47,7 @@ const decoded = jwt.verify(token, secretKey);
       email:     member.email,
       permissions: JSON.parse(member.permissions || '{}'),
     };
+    req._staffAuthed = true;
 
     next();
   } catch (err) {
@@ -77,14 +80,48 @@ const requireSchool = (req, res, next) => {
   next();
 };
 
-// Future use: per-module permission gate (not wired into any routes yet).
-// school_admin (top authority) always passes; everyone else needs the
-// moduleKey inside their school_members.permissions.modules array.
-const authorizeModule = (moduleKey) => (req, res, next) => {
+// Per-module permission gate.
+// school_admin (top authority) always passes; everyone else needs AT LEAST ONE of the given
+// module keys inside school_members.permissions.modules (User Management se assign hote hain).
+// Usage: authorizeModule('fees')  |  authorizeModule('exams', 'results')  (any-of)
+const authorizeModule = (...moduleKeys) => (req, res, next) => {
   if (req.user.role === 'school_admin') return next();
   const allowed = Array.isArray(req.user.permissions?.modules) ? req.user.permissions.modules : [];
-  if (allowed.includes(moduleKey)) return next();
-  return forbidden(res, `Access denied. You do not have access to the '${moduleKey}' module.`);
+  if (moduleKeys.some((k) => allowed.includes(k))) return next();
+  return forbidden(res, `Access denied. You do not have access to the '${moduleKeys.join("' / '")}' module.`);
 };
 
-module.exports = { authenticate, authorize, requireSchool, authorizeModule };
+// Route-level rules ko regex me compile karta hai.  Rule format: "METHOD /path/:param/*"
+//   METHOD = GET/POST/PUT/PATCH/DELETE ya * (any)   |   :param = ek path segment   |   * = kuch bhi
+const compileRules = (rules) =>
+  Object.entries(rules).map(([rule, value]) => {
+    const [method, pattern] = rule.split(' ');
+    const re = new RegExp(
+      '^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/:[A-Za-z]+/g, '[^/]+').replace(/\*/g, '.*') + '$'
+    );
+    return { method, re, value };
+  });
+
+// moduleGate(keys, rules) — server.js me mount-level par use hota hai:
+//   app.use('/api/fees', moduleGate('fees', { 'GET /overview': ['fees', 'dashboard'] }), require('./routes/fees'));
+// Default: har request par `keys` me se koi ek module permission chahiye (school_admin ko hamesha access).
+// rules (optional) se exceptions:
+//   value = ['k1','k2']  -> us route ke liye alag module keys
+//   value = 'open'       -> koi bhi authenticated staff (doosre modules ke shared lookups, jaise GET /students)
+//   value = 'skip'       -> koi staff auth nahi (route khud auth karta hai, jaise student token wala /homework/mine)
+const moduleGate = (keys, rules = {}) => {
+  const compiled = compileRules(rules);
+  const defaultGate = authorizeModule(...[].concat(keys));
+  return (req, res, next) => {
+    const rule = compiled.find((r) => (r.method === '*' || r.method === req.method) && r.re.test(req.path));
+    if (rule && rule.value === 'skip') return next();
+    authenticate(req, res, (err) => {
+      if (err) return next(err);
+      if (rule && rule.value === 'open') return next();
+      const gate = rule ? authorizeModule(...[].concat(rule.value)) : defaultGate;
+      return gate(req, res, next);
+    });
+  };
+};
+
+module.exports = { authenticate, authorize, requireSchool, authorizeModule, moduleGate };
