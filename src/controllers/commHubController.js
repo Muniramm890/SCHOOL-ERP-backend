@@ -535,17 +535,7 @@ exports.listThreads = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-async function loadThreadRecipient(schoolId, messageId, recipientId) {
-  return queryOne(
-    `SELECT r.id, r.recipient_type, r.user_id, r.student_id, r.reply_count,
-            CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE (s.first_name + ' ' + s.last_name) END AS name
-     FROM comm_recipients r
-     LEFT JOIN users u ON u.id = r.user_id
-     LEFT JOIN students s ON s.id = r.student_id
-     WHERE r.id=@rid AND r.message_id=@mid AND r.school_id=@sid`,
-    { rid: { type: sql.UniqueIdentifier, value: recipientId }, mid: { type: sql.UniqueIdentifier, value: messageId }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-  );
-}
+const loadThreadRecipient = (schoolId, messageId, recipientId) => chat.getThreadRecipient(schoolId, messageId, recipientId);
 
 // GET /api/comm/messages/:id/threads/:recipientId?since_seq=N   (marks the thread read for the admin side)
 exports.getThread = async (req, res, next) => {

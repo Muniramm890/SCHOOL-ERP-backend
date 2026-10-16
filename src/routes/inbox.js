@@ -14,6 +14,11 @@ const replyLimiter = rateLimit({
 router.use(authenticate);
 router.get('/', ctrl.list);
 router.get('/unread-count', ctrl.unreadCount);
+// sender side of a private thread (school_admin / the sender): unlimited back-and-forth with ONE person
+router.get('/thread/:messageId/:recipientId', ctrl.getSenderThread);
+router.get('/thread/:messageId/:recipientId/replies', ctrl.pollSenderThread);
+router.post('/thread/:messageId/:recipientId/reply', replyLimiter, ctrl.replySenderThread);
+
 router.get('/:messageId', ctrl.getConversation);
 router.get('/:messageId/replies', ctrl.pollReplies);
 router.post('/:messageId/reply', replyLimiter, ctrl.reply);

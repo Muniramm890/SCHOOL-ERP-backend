@@ -41,6 +41,19 @@ async function getManagedMessage(user, messageId) {
   return null;
 }
 
+// one thread (= one recipient of a message) with the person's display name; null if not in this school/message
+async function getThreadRecipient(schoolId, messageId, recipientId) {
+  return queryOne(
+    `SELECT r.id, r.recipient_type, r.user_id, r.student_id, r.reply_count, r.personal_body,
+            CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE (s.first_name + ' ' + s.last_name) END AS name
+     FROM comm_recipients r
+     LEFT JOIN users u ON u.id = r.user_id
+     LEFT JOIN students s ON s.id = r.student_id
+     WHERE r.id=@rid AND r.message_id=@mid AND r.school_id=@sid`,
+    { rid: U(recipientId), mid: U(messageId), sid: U(schoolId) }
+  );
+}
+
 const canReplyNow = (msg) =>
   !!msg.allow_replies && (!msg.replies_close_at || new Date(msg.replies_close_at) > new Date());
 
@@ -145,5 +158,5 @@ async function addReply({ schoolId, messageId, recipientId, side, senderUserId, 
 
 module.exports = {
   MAX_REPLY_LEN, isSchoolAdmin, cleanBody, canReplyNow,
-  getMyRecipient, getManagedMessage, addReply, pingAdminSide, pingRecipient, upsertPing,
+  getMyRecipient, getManagedMessage, getThreadRecipient, addReply, pingAdminSide, pingRecipient, upsertPing,
 };
