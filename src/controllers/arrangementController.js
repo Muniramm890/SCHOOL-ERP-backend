@@ -336,6 +336,7 @@ exports.notifySubstitutes = async (req, res, next) => {
       title: `Substitution Duty — ${dateStr}`,
       body: `Substitution duty assignments for ${dateStr}`,
       dedupeKey: `substitution:${date}`, // ← same date retried = same batch, no duplicates
+      allowReplies: true, // chat: teacher can answer the admin privately (e.g. "cannot take this period")
       recipients,
     });
 
