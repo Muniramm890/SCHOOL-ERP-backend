@@ -3,6 +3,7 @@ const { query, queryOne, withTransaction, sql } = require('../config/db');
 const { success, created, notFound, badRequest } = require('../utils/response');
 const { uploadBufferToAzure, deleteBlobFromAzure, getSignedDownloadUrl } = require('../services/uploadService');
 const { v4: uuidv4 } = require('uuid');
+const { getYearScope, ayParam } = require('../utils/academicYear');
 
 // ── POST /api/homework ─────────────────────────────────────────────────
 // body: title, description, given_date, due_date, targets = '[{"section_id":"..","subject_id":".."}, ...]'
@@ -85,11 +86,16 @@ exports.list = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
     const { section_id, subject_id } = req.query;
+    const ay = await getYearScope(req); // optional session filter (via the target sections)
 
     let where = `h.school_id = @sid AND h.deleted_at IS NULL`;
     const params = { sid: { type: sql.UniqueIdentifier, value: schoolId } };
     if (section_id) { where += ` AND ht.section_id = @secId`; params.secId = { type: sql.UniqueIdentifier, value: section_id }; }
     if (subject_id) { where += ` AND ht.subject_id = @subId`; params.subId = { type: sql.UniqueIdentifier, value: subject_id }; }
+    if (ay) {
+      where += ` AND EXISTS (SELECT 1 FROM sections sy WHERE sy.id = ht.section_id AND sy.school_id = @sid AND sy.academic_year_id = @ayId)`;
+      params.ayId = ayParam(ay);
+    }
 
     const rows = await query(
       `SELECT DISTINCT h.id, h.title, h.description, h.given_date, h.due_date, h.is_visible, h.created_at,

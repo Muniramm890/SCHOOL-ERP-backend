@@ -10,6 +10,7 @@
 // ══════════════════════════════════════════════════
 const { query, queryOne, withTransaction, sql } = require('../config/db');
 const { success, created, notFound, badRequest } = require('../utils/response');
+const { getYearScope, ayParam } = require('../utils/academicYear');
 const { v4: uuidv4 } = require('uuid');
 const { logAudit } = require('../utils/auditLogger');
 
@@ -356,6 +357,7 @@ exports.deleteStop = async (req, res, next) => {
 exports.listTripAssignments = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
+    const ay = await getYearScope(req);
     const rows = await query(
       `SELECT ta.*, r.name AS route_name, v.registration_no, d.full_name AS driver_name, c.full_name AS conductor_name
        FROM transport_trip_assignments ta
@@ -364,8 +366,9 @@ exports.listTripAssignments = async (req, res, next) => {
        JOIN transport_staff d ON d.id = ta.driver_id
        LEFT JOIN transport_staff c ON c.id = ta.conductor_id
        WHERE ta.school_id=@sid AND ta.status='active'
+       ${ay ? 'AND ta.academic_year_id=@ayId' : ''}
        ORDER BY r.name`,
-      { sid: uid(schoolId) }
+      { sid: uid(schoolId), ...(ay ? { ayId: ayParam(ay) } : {}) }
     );
     return success(res, rows.recordset);
   } catch (err) { next(err); }
@@ -426,6 +429,7 @@ exports.listAllocations = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
     const { routeId } = req.query;
+    const ay = await getYearScope(req);
     const rows = await query(
       `SELECT sta.*, s.first_name + ' ' + ISNULL(s.last_name,'') AS student_name, s.admission_no,
               r.name AS route_name, st.stop_name,
@@ -438,8 +442,9 @@ exports.listAllocations = async (req, res, next) => {
        JOIN transport_stops st ON st.id = sta.stop_id
        WHERE sta.school_id=@sid AND sta.status='active' AND sta.deleted_at IS NULL
        ${routeId ? 'AND sta.route_id=@rid' : ''}
+       ${ay ? 'AND sta.academic_year_id=@ayId' : ''}
        ORDER BY s.first_name`,
-      routeId ? { sid: uid(schoolId), rid: uid(routeId) } : { sid: uid(schoolId) }
+      { sid: uid(schoolId), ...(routeId ? { rid: uid(routeId) } : {}), ...(ay ? { ayId: ayParam(ay) } : {}) }
     );
     return success(res, rows.recordset);
   } catch (err) { next(err); }

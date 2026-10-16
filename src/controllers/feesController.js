@@ -2,6 +2,7 @@
 const { query, queryOne, withTransaction, sql } = require('../config/db');
 const { success, created, notFound, badRequest, paginated } = require('../utils/response');
 const { v4: uuidv4 } = require('uuid');
+const { getYearScope, ayParam } = require('../utils/academicYear');
 const rs = require('../services/receiptService');
 
 // ── AUDIT LOGGER HELPER ───────────────────────────────────────────────────
@@ -687,8 +688,17 @@ exports.listPayments = async (req, res, next) => {
     const { schoolId } = req.user;
     const { search, from, to, page = 1, limit = 25 } = req.query;
     const offset = (page - 1) * limit;
+    const ay = await getYearScope(req);
     let where = `fp.school_id=@sid AND fp.deleted_at IS NULL`;
     const params = { sid: { type: sql.UniqueIdentifier, value: schoolId } };
+    if (ay) {
+      // payment belongs to the session of its invoice; payments without an invoice fall back to the session's date range
+      where += ` AND (EXISTS (SELECT 1 FROM fee_invoices fi WHERE fi.id = fp.invoice_id AND fi.school_id = @sid AND fi.academic_year_id = @ayId)
+                  OR (fp.invoice_id IS NULL AND fp.payment_date >= @ayStart AND fp.payment_date <= @ayEnd))`;
+      params.ayId    = ayParam(ay);
+      params.ayStart = { type: sql.Date, value: ay.start_date };
+      params.ayEnd   = { type: sql.Date, value: ay.end_date };
+    }
     if (from) { where += ` AND fp.payment_date >= @from`; params.from = { type: sql.Date, value: from }; }
     if (to) { where += ` AND fp.payment_date <= @to`; params.to = { type: sql.Date, value: to }; }
     if (search) { where += ` AND (fp.receipt_no LIKE @search OR s.first_name+' '+ISNULL(s.last_name,'') LIKE @search)`; params.search = { type: sql.NVarChar(255), value: `%${search.trim()}%` }; }
