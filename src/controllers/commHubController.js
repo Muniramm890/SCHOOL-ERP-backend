@@ -2,7 +2,8 @@
 // 🔴 COMMUNICATION HUB — targeted notices/notifications across App / Email, with attachments
 // (WhatsApp channel removed — Meta blocks freeform business-initiated messages outside approved templates)
 const { query, queryOne, withTransaction, sql } = require('../config/db');
-const { success, created, notFound, badRequest, paginated } = require('../utils/response');
+const { success, created, notFound, badRequest, forbidden, paginated } = require('../utils/response');
+const chat = require('../services/chatService');
 const { sendHtmlEmail } = require('../services/emailService');
 const { uploadCommAttachment } = require('../services/uploadService');
 const { logAudit } = require('../utils/auditLogger');
@@ -176,8 +177,10 @@ exports.listMessages = async (req, res, next) => {
     const { page = 1, limit = 20, category } = req.query;
     const offset = (page - 1) * limit;
 
-    let where = `m.school_id=@sid`;
+    let where = `m.school_id=@sid AND m.deleted_at IS NULL`;
     const params = { sid: { type: sql.UniqueIdentifier, value: schoolId } };
+    // only school_admin sees every announcement; anyone else (e.g. a teacher) sees just the ones they sent
+    if (!chat.isSchoolAdmin(req.user)) { where += ` AND m.created_by=@me`; params.me = { type: sql.UniqueIdentifier, value: req.user.userId }; }
     if (category) { where += ` AND m.category=@cat`; params.cat = { type: sql.VarChar(30), value: category }; }
 
     const count = await queryOne(`SELECT COUNT(*) AS total FROM comm_messages m WHERE ${where}`, params);
@@ -186,7 +189,11 @@ exports.listMessages = async (req, res, next) => {
               (SELECT COUNT(*) FROM comm_recipients r WHERE r.message_id=m.id) AS recipient_count,
               (SELECT COUNT(*) FROM comm_deliveries d JOIN comm_recipients r ON r.id=d.recipient_id WHERE r.message_id=m.id AND d.status='sent') AS sent_count,
               (SELECT COUNT(*) FROM comm_deliveries d JOIN comm_recipients r ON r.id=d.recipient_id WHERE r.message_id=m.id AND d.status='failed') AS failed_count,
-              (SELECT COUNT(*) FROM comm_message_attachments a WHERE a.message_id=m.id) AS attachment_count
+              (SELECT COUNT(*) FROM comm_message_attachments a WHERE a.message_id=m.id) AS attachment_count,
+              (SELECT COUNT(*) FROM comm_recipients r WHERE r.message_id=m.id AND r.seen_at IS NOT NULL) AS seen_count,
+              (SELECT ISNULL(SUM(r.reply_count),0) FROM comm_recipients r WHERE r.message_id=m.id) AS reply_count,
+              (SELECT COUNT(*) FROM comm_recipients r WHERE r.message_id=m.id AND r.last_recipient_reply_at IS NOT NULL
+                  AND (r.admin_last_read_at IS NULL OR r.last_recipient_reply_at > r.admin_last_read_at)) AS unread_replies
        FROM comm_messages m
        JOIN users u ON u.id = m.created_by
        WHERE ${where}
@@ -205,10 +212,27 @@ exports.getMessage = async (req, res, next) => {
     const { id } = req.params;
     const msg = await queryOne(
       `SELECT m.*, u.full_name AS created_by_name FROM comm_messages m JOIN users u ON u.id=m.created_by
-       WHERE m.id=@id AND m.school_id=@sid`,
+       WHERE m.id=@id AND m.school_id=@sid AND m.deleted_at IS NULL`,
       { id: { type: sql.UniqueIdentifier, value: id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
     );
     if (!msg) return notFound(res, 'Message not found');
+
+    const manager = chat.isSchoolAdmin(req.user) || String(msg.created_by).toLowerCase() === String(req.user.userId).toLowerCase();
+    if (!manager) {
+      // plain recipient: only their own copy, NO channels / delivery stats / other people
+      const mine = await chat.getMyRecipient(schoolId, req.user.userId, id);
+      if (!mine) return notFound(res, 'Message not found');
+      const personal = await queryOne(`SELECT personal_body FROM comm_recipients WHERE id=@rid AND school_id=@sid`,
+        { rid: { type: sql.UniqueIdentifier, value: mine.id }, sid: { type: sql.UniqueIdentifier, value: schoolId } });
+      const atts = await query(
+        `SELECT id, file_name, file_url, file_type, file_size_bytes FROM comm_message_attachments WHERE message_id=@id AND school_id=@sid`,
+        { id: { type: sql.UniqueIdentifier, value: id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
+      );
+      return success(res, {
+        id: msg.id, title: msg.title, body: personal?.personal_body || msg.body, category: msg.category,
+        created_at: msg.created_at, created_by_name: msg.created_by_name, attachments: atts.recordset,
+      });
+    }
 
     const channels = await query(`SELECT channel FROM comm_message_channels WHERE message_id=@id`, { id: { type: sql.UniqueIdentifier, value: id } });
     const attachments = await query(
@@ -242,6 +266,9 @@ exports.createAndSend = async (req, res, next) => {
     const source_module = req.body.source_module || 'manual';
     const source_id = req.body.source_id || null;
     const academic_year_id_input = req.body.academic_year_id;
+    const allowReplies = [true, 1, '1', 'true', 'on'].includes(req.body.allow_replies);
+    const repliesCloseAt = req.body.replies_close_at ? new Date(req.body.replies_close_at) : null;
+    if (repliesCloseAt && isNaN(repliesCloseAt.getTime())) return badRequest(res, 'Invalid replies_close_at');
     let channels, targets;
 
     try {
@@ -304,10 +331,12 @@ exports.createAndSend = async (req, res, next) => {
         .input('srcMod', sql.VarChar(30), source_module)
         .input('srcId', sql.UniqueIdentifier, source_id)
         .input('by', sql.UniqueIdentifier, userId)
+        .input('ar', sql.Bit, allowReplies ? 1 : 0)
+        .input('rc', sql.DateTime2, repliesCloseAt)
         .query(
-          `INSERT INTO comm_messages (school_id, academic_year_id, title, body, category, source_module, source_id, status, created_by)
+          `INSERT INTO comm_messages (school_id, academic_year_id, title, body, category, source_module, source_id, status, created_by, allow_replies, replies_close_at)
            OUTPUT INSERTED.id
-           VALUES (@sid, @ay, @title, @body, @cat, @srcMod, @srcId, 'sending', @by)`
+           VALUES (@sid, @ay, @title, @body, @cat, @srcMod, @srcId, 'sending', @by, @ar, @rc)`
         );
       const msgId = msgRes.recordset[0].id;
 
@@ -450,26 +479,122 @@ exports.getViewers = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
     const { id } = req.params;
+    const msg = await chat.getManagedMessage(req.user, id);
+    if (!msg) return notFound(res, 'Message not found');
+    const P = { id: { type: sql.UniqueIdentifier, value: id }, sid: { type: sql.UniqueIdentifier, value: schoolId } };
 
-    const staffViewers = await query(
-      `SELECT u.full_name AS name, 'staff' AS recipient_type, sn.is_read, sn.created_at
+    const rows = await query(
+      `SELECT CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE (s.first_name + ' ' + s.last_name) END AS name,
+              r.recipient_type,
+              CASE WHEN r.seen_at IS NULL THEN 0 ELSE 1 END AS is_read,
+              COALESCE(r.seen_at, r.created_at) AS created_at,
+              r.seen_at, r.reply_count
        FROM comm_recipients r
-       JOIN staff_notifications sn ON sn.related_id = r.message_id AND sn.user_id = r.user_id AND sn.school_id=@sid
-       JOIN users u ON u.id = r.user_id
-       WHERE r.message_id=@id AND r.recipient_type='staff'`,
+       LEFT JOIN users u ON u.id = r.user_id
+       LEFT JOIN students s ON s.id = r.student_id
+       WHERE r.message_id=@id AND r.school_id=@sid
+       ORDER BY r.seen_at DESC, name`,
+      P
+    );
+    const all = rows.recordset;
+    return success(res, { total: all.length, seen: all.filter((v) => v.is_read).length, viewers: all });
+  } catch (err) { next(err); }
+};
+
+// ══ THREADS (admin side) ══ school_admin or the sender only; every thread is private to one recipient
+
+// GET /api/comm/messages/:id/threads?status=unanswered
+exports.listThreads = async (req, res, next) => {
+  try {
+    const { schoolId } = req.user;
+    const { id } = req.params;
+    const msg = await chat.getManagedMessage(req.user, id);
+    if (!msg) return notFound(res, 'Message not found');
+    const unansweredOnly = req.query.status === 'unanswered';
+
+    const rows = await query(
+      `SELECT r.id AS recipient_id, r.recipient_type, r.user_id, r.student_id,
+              CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE (s.first_name + ' ' + s.last_name) END AS name,
+              r.reply_count, r.seen_at, r.last_recipient_reply_at, r.last_admin_reply_at,
+              CASE WHEN r.last_recipient_reply_at IS NOT NULL AND (r.admin_last_read_at IS NULL OR r.last_recipient_reply_at > r.admin_last_read_at)
+                   THEN 1 ELSE 0 END AS unread,
+              CASE WHEN r.last_recipient_reply_at IS NOT NULL AND (r.last_admin_reply_at IS NULL OR r.last_recipient_reply_at > r.last_admin_reply_at)
+                   THEN 1 ELSE 0 END AS unanswered,
+              LEFT(la.body, 120) AS last_reply_preview, la.sender_side AS last_reply_side
+       FROM comm_recipients r
+       LEFT JOIN users u ON u.id = r.user_id
+       LEFT JOIN students s ON s.id = r.student_id
+       OUTER APPLY (SELECT TOP 1 cr.body, cr.sender_side FROM comm_replies cr
+                    WHERE cr.school_id=r.school_id AND cr.recipient_id=r.id AND cr.deleted_at IS NULL ORDER BY cr.seq DESC) la
+       WHERE r.message_id=@id AND r.school_id=@sid AND r.reply_count > 0
+         ${unansweredOnly ? "AND r.last_recipient_reply_at IS NOT NULL AND (r.last_admin_reply_at IS NULL OR r.last_recipient_reply_at > r.last_admin_reply_at)" : ''}
+       ORDER BY unread DESC, r.last_recipient_reply_at DESC`,
       { id: { type: sql.UniqueIdentifier, value: id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
     );
+    return success(res, { message_id: id, allow_replies: !!msg.allow_replies, threads: rows.recordset });
+  } catch (err) { next(err); }
+};
 
-    const studentViewers = await query(
-      `SELECT (s.first_name + ' ' + s.last_name) AS name, 'student' AS recipient_type, stn.is_read, stn.created_at
-       FROM comm_recipients r
-       JOIN student_notifications stn ON stn.related_id = r.message_id AND stn.student_id = r.student_id AND stn.school_id=@sid
-       JOIN students s ON s.id = r.student_id
-       WHERE r.message_id=@id AND r.recipient_type='student'`,
-      { id: { type: sql.UniqueIdentifier, value: id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
+async function loadThreadRecipient(schoolId, messageId, recipientId) {
+  return queryOne(
+    `SELECT r.id, r.recipient_type, r.user_id, r.student_id, r.reply_count,
+            CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE (s.first_name + ' ' + s.last_name) END AS name
+     FROM comm_recipients r
+     LEFT JOIN users u ON u.id = r.user_id
+     LEFT JOIN students s ON s.id = r.student_id
+     WHERE r.id=@rid AND r.message_id=@mid AND r.school_id=@sid`,
+    { rid: { type: sql.UniqueIdentifier, value: recipientId }, mid: { type: sql.UniqueIdentifier, value: messageId }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
+  );
+}
+
+// GET /api/comm/messages/:id/threads/:recipientId?since_seq=N   (marks the thread read for the admin side)
+exports.getThread = async (req, res, next) => {
+  try {
+    const { schoolId } = req.user;
+    const { id, recipientId } = req.params;
+    const since = parseInt(req.query.since_seq, 10) || 0;
+    const msg = await chat.getManagedMessage(req.user, id);
+    if (!msg) return notFound(res, 'Message not found');
+    const rcp = await loadThreadRecipient(schoolId, id, recipientId);
+    if (!rcp) return notFound(res, 'Thread not found');
+
+    const replies = await query(
+      `SELECT cr.seq, cr.id, cr.sender_side, cr.kind, cr.body, cr.created_at, su.full_name AS sender_name
+       FROM comm_replies cr LEFT JOIN users su ON su.id = cr.sender_user_id
+       WHERE cr.school_id=@sid AND cr.recipient_id=@rid AND cr.deleted_at IS NULL AND cr.seq > @since
+       ORDER BY cr.seq`,
+      { sid: { type: sql.UniqueIdentifier, value: schoolId }, rid: { type: sql.UniqueIdentifier, value: recipientId }, since: { type: sql.BigInt, value: since } }
     );
+    await query(`UPDATE comm_recipients SET admin_last_read_at = SYSUTCDATETIME() WHERE id=@rid AND school_id=@sid`,
+      { rid: { type: sql.UniqueIdentifier, value: recipientId }, sid: { type: sql.UniqueIdentifier, value: schoolId } });
 
-    const all = [...staffViewers.recordset, ...studentViewers.recordset];
-    return success(res, { total: all.length, seen: all.filter(v => v.is_read).length, viewers: all });
+    return success(res, {
+      recipient: { recipient_id: rcp.id, name: rcp.name, recipient_type: rcp.recipient_type },
+      message: { id: msg.id, title: msg.title, allow_replies: !!msg.allow_replies },
+      replies: replies.recordset,
+    });
+  } catch (err) { next(err); }
+};
+
+// POST /api/comm/messages/:id/threads/:recipientId/reply   { body, client_msg_id }
+exports.replyThread = async (req, res, next) => {
+  try {
+    const { schoolId, userId } = req.user;
+    const { id, recipientId } = req.params;
+    const body = chat.cleanBody(req.body?.body);
+    if (!body) return badRequest(res, 'Reply cannot be empty');
+    if (body.length > chat.MAX_REPLY_LEN) return badRequest(res, `Reply is too long (max ${chat.MAX_REPLY_LEN} characters)`);
+    const clientMsgId = req.body?.client_msg_id ? String(req.body.client_msg_id).slice(0, 40) : null;
+
+    const msg = await chat.getManagedMessage(req.user, id);
+    if (!msg) return notFound(res, 'Message not found');
+    const rcp = await loadThreadRecipient(schoolId, id, recipientId);
+    if (!rcp) return notFound(res, 'Thread not found');
+    // admin may answer an existing thread, or reply on an announcement that has replies enabled
+    if (!msg.allow_replies && !rcp.reply_count) return forbidden(res, 'Replies are not enabled for this announcement');
+
+    const reply = await chat.addReply({ schoolId, messageId: id, recipientId, side: 'admin', senderUserId: userId, body, clientMsgId });
+    if (!reply.duplicate) await chat.pingRecipient({ schoolId, recipient: rcp, messageId: id, title: msg.title, preview: body });
+    return created(res, reply, 'Reply sent');
   } catch (err) { next(err); }
 };

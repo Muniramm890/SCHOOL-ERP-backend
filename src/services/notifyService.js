@@ -22,16 +22,17 @@ const { sendTemplate } = require('./whatsappService');
  * @param {string} [opts.sourceId]    - optional entity id this batch relates to
  * @param {string} opts.title         - comm_messages.title
  * @param {string} opts.body          - comm_messages.body (short summary)
+ * @param {boolean} [opts.allowReplies] - chat: let recipients reply (private thread with the admin side). default false
  * @param {string} [opts.dedupeKey]   - e.g. `substitution:${schoolId}:${date}` — reused on retry so no duplicate batch/spam
  * @param {Array}  opts.recipients    - [{ userId, name, email, phone,
- *                                         appMessage,                       // string or null -> 'app' channel
+ *                                         appMessage,                       // string or null -> 'app' channel AND the chat bubble this person sees
  *                                         emailSubject, emailHtml,          // both required -> 'email' channel
  *                                         whatsapp: { template, lang, params:[...] } // -> 'whatsapp' channel
  *                                     }]
  * @returns {Promise<{comm_message_id:string, notified:number, results:Array, status:string}>}
  */
 async function notifyViaCommHub(opts) {
-  const { schoolId, academicYearId, userId, schoolName, sourceModule, sourceId = null, title, body, dedupeKey, recipients } = opts;
+  const { schoolId, academicYearId, userId, schoolName, sourceModule, sourceId = null, title, body, dedupeKey, recipients, allowReplies = false } = opts;
   if (!recipients || recipients.length === 0) return { comm_message_id: null, notified: 0, results: [], status: 'skipped' };
 
   // ── 1) reuse existing batch for this dedupeKey (idempotent retry) or create fresh ──
@@ -47,9 +48,10 @@ async function notifyViaCommHub(opts) {
   if (!msgId) {
     msgId = uuidv4();
     await query(
-      `INSERT INTO comm_messages (id, school_id, academic_year_id, title, body, category, source_module, source_id, dedupe_key, status, created_by, created_at)
-       VALUES (@id, @sid, @ay, @title, @body, @mod, @mod, @sourceId, @dk, 'pending', @by, @now)`,
+      `INSERT INTO comm_messages (id, school_id, academic_year_id, title, body, category, source_module, source_id, dedupe_key, status, created_by, created_at, allow_replies, kind)
+       VALUES (@id, @sid, @ay, @title, @body, @mod, @mod, @sourceId, @dk, 'pending', @by, @now, @ar, 'system')`,
       {
+        ar: { type: sql.Bit, value: allowReplies ? 1 : 0 },
         id: { type: sql.UniqueIdentifier, value: msgId },
         sid: { type: sql.UniqueIdentifier, value: schoolId },
         ay: { type: sql.UniqueIdentifier, value: academicYearId },
@@ -83,9 +85,10 @@ async function notifyViaCommHub(opts) {
     if (!recipientId) {
       recipientId = uuidv4();
       await query(
-        `INSERT INTO comm_recipients (id, school_id, message_id, recipient_type, student_id, user_id, created_at)
-         VALUES (@id, @sid, @mid, 'staff', NULL, @uid, @now)`,
+        `INSERT INTO comm_recipients (id, school_id, message_id, recipient_type, student_id, user_id, created_at, personal_body)
+         VALUES (@id, @sid, @mid, 'staff', NULL, @uid, @now, @pb)`,
         {
+          pb: { type: sql.NVarChar(sql.MAX), value: rcpt.appMessage ? String(rcpt.appMessage) : null },
           id: { type: sql.UniqueIdentifier, value: recipientId },
           sid: { type: sql.UniqueIdentifier, value: schoolId },
           mid: { type: sql.UniqueIdentifier, value: msgId },
@@ -93,6 +96,12 @@ async function notifyViaCommHub(opts) {
           now: { type: sql.DateTime2, value: new Date() },
         }
       );
+    }
+
+    else if (rcpt.appMessage) {
+      // retry with possibly changed content -> keep the chat bubble up to date
+      await query(`UPDATE comm_recipients SET personal_body=@pb WHERE id=@rid AND school_id=@sid`,
+        { pb: { type: sql.NVarChar(sql.MAX), value: String(rcpt.appMessage) }, rid: { type: sql.UniqueIdentifier, value: recipientId }, sid: { type: sql.UniqueIdentifier, value: schoolId } });
     }
 
     const prior = await query(`SELECT channel, status FROM comm_deliveries WHERE recipient_id=@rid`,

@@ -102,6 +102,7 @@ app.use(`${API}/quick-tests`,   moduleGate('tests'),                            
 app.use(`${API}/exams`,         moduleGate(['exams', 'results']),                          require('./routes/exams'));
 app.use(`${API}/notices`,       require('./routes/notices'));
 app.use(`${API}/notifications`, require('./routes/notifications'));
+app.use(`${API}/inbox`,         require('./routes/inbox'));
 app.use(`${API}/comm`,          moduleGate('commhub',  { 'GET /messages/:id': 'open' }),   require('./routes/commHub'));
 app.use(`${API}/homework`,      moduleGate('homework', { 'GET /mine': 'skip' }),           require('./routes/homework'));
 app.use('/api/attendance',      moduleGate('attendance', { 'GET /staff/roster': ['attendance', 'dashboard'] }), require('./routes/attendance'));
