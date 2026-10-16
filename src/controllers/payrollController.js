@@ -2,6 +2,7 @@
 const { query, queryOne, sql } = require('../config/db');
 const { success, created, notFound, badRequest } = require('../utils/response');
 const { v4: uuidv4 } = require('uuid');
+const { getYearScope, ayParam } = require('../utils/academicYear');
 const { uploadPayslipPdf, getSignedDownloadUrl } = require('../services/uploadService');
 const { generatePayslipPdfBuffer } = require('../services/payslipPdfService');
 
@@ -262,8 +263,14 @@ exports.listPayslips = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
     const { month_year, staff_id } = req.query;
+    const ay = await getYearScope(req);
     let where = `p.school_id=@sid AND p.deleted_at IS NULL`;
     const params = { sid: { type: sql.UniqueIdentifier, value: schoolId } };
+    if (ay) { // session = every month between the year's start and end
+      where += ` AND p.month_year >= @ayFrom AND p.month_year <= @ayTo`;
+      params.ayFrom = { type: sql.NVarChar(7), value: ay.start_date.slice(0, 7) };
+      params.ayTo   = { type: sql.NVarChar(7), value: ay.end_date.slice(0, 7) };
+    }
     if (month_year) { where += ` AND p.month_year=@my`; params.my = { type: sql.NVarChar(7), value: month_year }; }
     if (staff_id) { where += ` AND p.staff_id=@staffId`; params.staffId = { type: sql.UniqueIdentifier, value: staff_id }; }
 

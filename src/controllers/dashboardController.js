@@ -1,6 +1,7 @@
 // src/controllers/dashboardController.js
 const { query, queryOne, sql } = require('../config/db');
 const { success } = require('../utils/response');
+const { getYearScope, ayParam } = require('../utils/academicYear');
 
 // ── GET /api/dashboard/summary ────────────────────────────────────────────
 // Returns all KPIs needed by the Dashboard module in one call
@@ -8,6 +9,8 @@ exports.getSummary = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
     const sid = { type: sql.UniqueIdentifier, value: schoolId };
+    const ay = await getYearScope(req);   // optional session; null => old behaviour
+    const ayId = ayParam(ay);
 
     // Run all aggregates in parallel
     const [
@@ -24,9 +27,13 @@ exports.getSummary = async (req, res, next) => {
       // Student counts
       queryOne(
         `SELECT COUNT(*) AS total,
-                SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) AS active
-         FROM students WHERE school_id = @sid AND deleted_at IS NULL`,
-        { sid }
+                SUM(CASE WHEN s.is_active = 1 THEN 1 ELSE 0 END) AS active
+         FROM students s WHERE s.school_id = @sid AND s.deleted_at IS NULL
+           AND (@ayId IS NULL OR EXISTS (
+                 SELECT 1 FROM enrolments e
+                 WHERE e.student_id = s.id AND e.school_id = @sid
+                   AND e.academic_year_id = @ayId AND e.deleted_at IS NULL))`,
+        { sid, ayId }
       ),
 
       // Staff counts + today's attendance
@@ -107,11 +114,12 @@ query(
          FROM enrolments e
          JOIN sections sc ON sc.id = e.section_id
          JOIN grades g ON g.id = sc.grade_id
-         JOIN academic_years ay ON ay.id = e.academic_year_id AND ay.is_current = 1
-         WHERE e.school_id = @sid AND e.is_active = 1 AND e.deleted_at IS NULL
+         JOIN academic_years ay ON ay.id = e.academic_year_id
+              AND (ay.id = @ayId OR (@ayId IS NULL AND ay.is_current = 1))
+         WHERE e.school_id = @sid AND (@ayId IS NOT NULL OR e.is_active = 1) AND e.deleted_at IS NULL
          GROUP BY g.name, g.numeric_order
          ORDER BY g.numeric_order`,
-        { sid }
+        { sid, ayId }
       ),
 
       // Recent audit logs (last 10 actions)
@@ -168,11 +176,13 @@ exports.getQuickStats = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
     const sid = { type: sql.UniqueIdentifier, value: schoolId };
+    const ay = await getYearScope(req);
+    const ayId = ayParam(ay);
 
     const stats = await queryOne(
       `SELECT
          (SELECT COUNT(*) FROM grades WHERE school_id = @sid AND is_active=1 AND deleted_at IS NULL) AS total_classes,
-         (SELECT COUNT(*) FROM sections WHERE school_id = @sid AND is_active=1 AND deleted_at IS NULL) AS total_sections,
+         (SELECT COUNT(*) FROM sections WHERE school_id = @sid AND is_active=1 AND deleted_at IS NULL AND (@ayId IS NULL OR academic_year_id = @ayId)) AS total_sections,
          (SELECT COUNT(DISTINCT name) FROM subjects WHERE school_id = @sid AND is_active=1 AND deleted_at IS NULL) AS total_subjects,
          (SELECT CAST(
             CAST(SUM(CASE WHEN status='P' THEN 1.0 ELSE 0 END) AS FLOAT)
@@ -182,7 +192,7 @@ exports.getQuickStats = async (req, res, next) => {
             AND deleted_at IS NULL
             AND attendance_date >= DATEADD(MONTH,-1,GETUTCDATE())
          ) AS avg_attendance_last_month`,
-      { sid }
+      { sid, ayId }
     );
 
     return success(res, stats);

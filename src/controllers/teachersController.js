@@ -1,6 +1,7 @@
 // src/controllers/teachersController.js
 const { query, queryOne, withTransaction, sql } = require('../config/db');
 const { success, created, notFound, badRequest } = require('../utils/response');
+const { getYearScope, ayParam } = require('../utils/academicYear');
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 
@@ -286,6 +287,7 @@ exports.getTeacherSubjects = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
     const { userId } = req.params;
+    const ay = await getYearScope(req);
 
     const result = await query(
       `SELECT ts.id, ts.subject_id, s.name AS subject_name,
@@ -295,8 +297,9 @@ exports.getTeacherSubjects = async (req, res, next) => {
        JOIN sections sec ON sec.id = ts.section_id
        JOIN grades g ON g.id = sec.grade_id
        WHERE ts.school_id = @sid AND ts.teacher_user_id = @uid AND ts.is_active = 1 AND ts.deleted_at IS NULL
+         AND (@ayId IS NULL OR ts.academic_year_id = @ayId)
        ORDER BY g.numeric_order, sec.name, s.name`,
-      { sid: { type: sql.UniqueIdentifier, value: schoolId }, uid: { type: sql.UniqueIdentifier, value: userId } }
+      { sid: { type: sql.UniqueIdentifier, value: schoolId }, uid: { type: sql.UniqueIdentifier, value: userId }, ayId: ayParam(ay) }
     );
 
     return success(res, result.recordset, 'Teacher subject assignments fetched');
@@ -309,6 +312,7 @@ exports.getSectionAssignments = async (req, res, next) => {
     const { schoolId } = req.user;
     const { section_id } = req.query;
     if (!section_id) return badRequest(res, 'section_id is required');
+    const ay = await getYearScope(req);
 
     const result = await query(
       `SELECT ts.id AS assignment_id, ts.subject_id, s.name AS subject_name, ts.teacher_user_id, u.full_name AS teacher_name
@@ -316,8 +320,9 @@ exports.getSectionAssignments = async (req, res, next) => {
        JOIN subjects s ON s.id = ts.subject_id
        JOIN users u ON u.id = ts.teacher_user_id
        WHERE ts.school_id = @sid AND ts.section_id = @secId AND ts.is_active = 1 AND ts.deleted_at IS NULL
+         AND (@ayId IS NULL OR ts.academic_year_id = @ayId)
        ORDER BY s.name, u.full_name`,
-      { sid: { type: sql.UniqueIdentifier, value: schoolId }, secId: { type: sql.UniqueIdentifier, value: section_id } }
+      { sid: { type: sql.UniqueIdentifier, value: schoolId }, secId: { type: sql.UniqueIdentifier, value: section_id }, ayId: ayParam(ay) }
     );
 
     return success(res, result.recordset, 'Section subject-teacher map fetched');

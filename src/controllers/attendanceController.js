@@ -3,6 +3,7 @@ const { query, queryOne, withTransaction, sql } = require('../config/db');
 const { success, badRequest, notFound } = require('../utils/response');
 const { logAudit } = require('../utils/auditLogger');
 const { v4: uuidv4 } = require('uuid');
+const { getYearScope, ayParam } = require('../utils/academicYear');
 
 const VALID_STATUSES = ['P', 'A', 'L', 'OD'];
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
@@ -414,8 +415,10 @@ exports.getStaffAnalysis = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
     const { from, to } = req.query;
-    const rangeFrom = from || daysAgoStr(6);
-    const rangeTo = to || todayStr();
+    const ay = await getYearScope(req);
+    // with a session selected and no explicit dates -> whole session (end clipped to today)
+    const rangeFrom = from || (ay ? ay.start_date : daysAgoStr(6));
+    const rangeTo = to || (ay ? (ay.end_date < todayStr() ? ay.end_date : todayStr()) : todayStr());
     const p = {
       sid: { type: sql.UniqueIdentifier, value: schoolId },
       from: { type: sql.Date, value: rangeFrom },
