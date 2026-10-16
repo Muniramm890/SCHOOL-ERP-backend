@@ -4,6 +4,7 @@ const { success, created, notFound, badRequest } = require('../utils/response');
 const { v4: uuidv4 } = require('uuid');
 const { sendHtmlEmail } = require('../services/emailService');
 const { sendTemplate } = require('../services/whatsappService');
+const { getYearScope } = require('../utils/academicYear');
 
 async function assertStaffBelongsToSchool(schoolId, staffId) {
   const row = await queryOne(
@@ -25,6 +26,30 @@ exports.getDraft = async (req, res, next) => {
 
     // ⚠️ Confirm convention matches your timetable module: 0=Sunday...6=Saturday
     const dayOfWeek = new Date(date + 'T00:00:00').getDay();
+
+    // Timetable session-wise hota hai. Year ka order:
+    //   1) ?academic_year_id= (validated against this school)
+    //   2) the academic year whose start/end covers `date`
+    //   3) the school's current year
+    // Kuch bhi resolve na ho to purana behaviour (no year filter).
+    let ayId = null;
+    const explicitYear = await getYearScope(req);
+    if (explicitYear) {
+      ayId = explicitYear.id;
+    } else {
+      const sidP = { type: sql.UniqueIdentifier, value: schoolId };
+      const byDate = await queryOne(
+        `SELECT TOP 1 id FROM academic_years
+         WHERE school_id=@sid AND deleted_at IS NULL AND @date >= start_date AND @date <= end_date
+         ORDER BY is_current DESC, start_date DESC`,
+        { sid: sidP, date: { type: sql.Date, value: date } }
+      );
+      const yr = byDate || await queryOne(
+        `SELECT TOP 1 id FROM academic_years WHERE school_id=@sid AND is_current=1 AND deleted_at IS NULL`,
+        { sid: sidP }
+      );
+      ayId = yr ? yr.id : null;
+    }
 
     const [periodSlots, teachers, attendance, timetable, subjectTeachers, existingSubs] = await Promise.all([
       query(`SELECT id, period_number, label, start_time, end_time, is_break
@@ -48,8 +73,10 @@ exports.getDraft = async (req, res, next) => {
              LEFT JOIN sections sec ON sec.id = te.section_id
              LEFT JOIN grades g ON g.id = sec.grade_id
              LEFT JOIN subjects sub ON sub.id = te.subject_id
-             WHERE te.school_id=@sid AND te.day_of_week=@dow`,
-        { sid: { type: sql.UniqueIdentifier, value: schoolId }, dow: { type: sql.TinyInt, value: dayOfWeek } }),
+             WHERE te.school_id=@sid AND te.day_of_week=@dow
+               AND (@ayId IS NULL OR te.academic_year_id=@ayId)`,
+        { sid: { type: sql.UniqueIdentifier, value: schoolId }, dow: { type: sql.TinyInt, value: dayOfWeek },
+          ayId: { type: sql.UniqueIdentifier, value: ayId } }),
 
       query(`SELECT subject_id, teacher_user_id AS teacher_id FROM subject_teachers
              WHERE school_id=@sid AND is_active=1 AND deleted_at IS NULL`,
@@ -61,7 +88,7 @@ exports.getDraft = async (req, res, next) => {
     ]);
 
     return success(res, {
-      date, day_of_week: dayOfWeek,
+      date, day_of_week: dayOfWeek, academic_year_id: ayId,
       period_slots: periodSlots.recordset,
       teachers: teachers.recordset,
       attendance: attendance.recordset,
