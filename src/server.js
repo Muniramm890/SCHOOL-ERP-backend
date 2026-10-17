@@ -28,6 +28,9 @@ app.use(compression());
 // ── CORS ──────────────────────────────────────────────────────────────
 // ── CORS ──────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.FRONTEND_URL || 'https://admin.schooloffice.tech,https://teachers.schooloffice.tech,https://student.schooloffice.tech,https://admin.schooloffice.tech/?signup=1,https://dpw5tz.csb.app,https://k5wrj7.csb.app').split(',');
+// Capacitor (Android/iOS) app WebView origins — hamesha allowed, chahe FRONTEND_URL env set ho. (Auth token header se hota hai, cookies se nahi.)
+const nativeAppOrigins = ['https://localhost', 'http://localhost', 'capacitor://localhost', 'ionic://localhost'];
+nativeAppOrigins.forEach((o) => { if (!allowedOrigins.includes(o)) allowedOrigins.push(o); });
 
 app.use(cors({
   origin: (origin, cb) => {
