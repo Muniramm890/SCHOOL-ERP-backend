@@ -120,6 +120,7 @@ app.use(`${API}/student/fees`,        require('./routes/student/Fees'));
 app.use(`${API}/student/payments`,    require('./routes/student/Payments'));
 app.use(`${API}/student/results`,     require('./routes/student/Results'));
 app.use(`${API}/student/dashboard`,   require('./routes/student/Dashboard'));
+app.use(`${API}/student/inbox`,       require('./routes/student/Inbox'));
 app.use(`${API}/student/quick-tests`, require('./routes/student/QuickTests'));
 
 // ── 404 ────────────────────────────────────────────────────────────────

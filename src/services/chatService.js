@@ -28,6 +28,18 @@ async function getMyRecipient(schoolId, userId, messageId) {
   );
 }
 
+// ── the logged-in STUDENT's own recipient row for a message (null if not a recipient) ──
+async function getMyStudentRecipient(schoolId, studentId, messageId) {
+  return queryOne(
+    `SELECT r.id, r.message_id, r.seen_at
+     FROM comm_recipients r
+     JOIN comm_messages m ON m.id = r.message_id AND m.school_id = r.school_id
+     WHERE r.school_id=@sid AND r.message_id=@mid AND r.recipient_type='student' AND r.student_id=@stid
+       AND m.deleted_at IS NULL`,
+    { sid: U(schoolId), mid: U(messageId), stid: U(studentId) }
+  );
+}
+
 // ── message the caller may MANAGE (see stats + all threads): school_admin or the sender ──
 async function getManagedMessage(user, messageId) {
   const m = await queryOne(
@@ -45,7 +57,7 @@ async function getManagedMessage(user, messageId) {
 async function getThreadRecipient(schoolId, messageId, recipientId) {
   return queryOne(
     `SELECT r.id, r.recipient_type, r.user_id, r.student_id, r.reply_count, r.personal_body,
-            CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE (s.first_name + ' ' + s.last_name) END AS name
+            CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE LTRIM(RTRIM(CONCAT(s.first_name, ' ', s.last_name))) END AS name
      FROM comm_recipients r
      LEFT JOIN users u ON u.id = r.user_id
      LEFT JOIN students s ON s.id = r.student_id
@@ -158,5 +170,5 @@ async function addReply({ schoolId, messageId, recipientId, side, senderUserId, 
 
 module.exports = {
   MAX_REPLY_LEN, isSchoolAdmin, cleanBody, canReplyNow,
-  getMyRecipient, getManagedMessage, getThreadRecipient, addReply, pingAdminSide, pingRecipient, upsertPing,
+  getMyRecipient, getMyStudentRecipient, getManagedMessage, getThreadRecipient, addReply, pingAdminSide, pingRecipient, upsertPing,
 };

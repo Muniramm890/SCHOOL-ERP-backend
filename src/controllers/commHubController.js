@@ -484,7 +484,7 @@ exports.getViewers = async (req, res, next) => {
     const P = { id: { type: sql.UniqueIdentifier, value: id }, sid: { type: sql.UniqueIdentifier, value: schoolId } };
 
     const rows = await query(
-      `SELECT CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE (s.first_name + ' ' + s.last_name) END AS name,
+      `SELECT CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE LTRIM(RTRIM(CONCAT(s.first_name, ' ', s.last_name))) END AS name,
               r.recipient_type,
               CASE WHEN r.seen_at IS NULL THEN 0 ELSE 1 END AS is_read,
               COALESCE(r.seen_at, r.created_at) AS created_at,
@@ -514,7 +514,7 @@ exports.listThreads = async (req, res, next) => {
 
     const rows = await query(
       `SELECT r.id AS recipient_id, r.recipient_type, r.user_id, r.student_id,
-              CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE (s.first_name + ' ' + s.last_name) END AS name,
+              CASE WHEN r.recipient_type='staff' THEN u.full_name ELSE LTRIM(RTRIM(CONCAT(s.first_name, ' ', s.last_name))) END AS name,
               r.reply_count, r.seen_at, r.last_recipient_reply_at, r.last_admin_reply_at,
               CASE WHEN r.last_recipient_reply_at IS NOT NULL AND (r.admin_last_read_at IS NULL OR r.last_recipient_reply_at > r.admin_last_read_at)
                    THEN 1 ELSE 0 END AS unread,

@@ -56,7 +56,7 @@ exports.list = async (req, res, next) => {
     const th = await query(
       `;WITH c AS (
          SELECT m.id AS message_id, r.id AS recipient_id, m.title, m.category, m.source_module, m.kind, m.created_at,
-                CASE WHEN r.recipient_type='staff' THEN su.full_name ELSE (st.first_name + ' ' + st.last_name) END AS person_name,
+                CASE WHEN r.recipient_type='staff' THEN su.full_name ELSE LTRIM(RTRIM(CONCAT(st.first_name, ' ', st.last_name))) END AS person_name,
                 r.recipient_type, r.reply_count,
                 la.body AS last_reply_body, la.sender_side AS last_reply_side,
                 CASE WHEN ${ADMIN_UNREAD_SQL} THEN 1 ELSE 0 END AS unread,
