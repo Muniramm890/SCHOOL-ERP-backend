@@ -3,7 +3,7 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { withTransaction, queryOne, sql } = require('../config/db');
-const { success, badRequest, notFound } = require('../utils/response');
+const { success, error, badRequest, notFound } = require('../utils/response');
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -29,6 +29,48 @@ const cashfreeHeaders = () => ({
   'x-client-secret': process.env.CASHFREE_SECRET_KEY,
 });
 
+// ── Cashfree helpers ────────────────────────────────────────────────────────
+const CF_ORDER_ID_RE = /^[A-Za-z0-9_-]{3,64}$/;
+// Statuses after which Cashfree will never turn the payment into SUCCESS.
+const CF_TERMINAL_FAIL = new Set(['FAILED', 'USER_DROPPED', 'CANCELLED', 'VOID']);
+// Cashfree can take a few seconds to flip PENDING -> SUCCESS (UPI especially), so verify polls instead of asking once.
+const CF_VERIFY_ATTEMPTS = Number(process.env.CASHFREE_VERIFY_ATTEMPTS) || 6;
+const CF_VERIFY_DELAY_MS = Number(process.env.CASHFREE_VERIFY_DELAY_MS) || 2000;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// GET against Cashfree with a timeout. Never throws; logs HTTP status + Cashfree's error body (contains no secrets)
+// so a failing verification can be diagnosed from the server logs.
+async function cashfreeGet(path) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const res = await fetch(`${CASHFREE_BASE_URL}${path}`, { method: 'GET', headers: cashfreeHeaders(), signal: ctrl.signal });
+    let body = null;
+    try { body = await res.json(); } catch { /* non-JSON body */ }
+    if (!res.ok) console.error(`[Cashfree GET ${path}] HTTP ${res.status}`, JSON.stringify(body));
+    return { ok: res.ok, status: res.status, body };
+  } catch (err) {
+    console.error(`[Cashfree GET ${path}] request failed:`, err.message);
+    return { ok: false, status: 0, body: null };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Where Cashfree should send the browser back after a redirect-style payment (UPI app, 3-D Secure, popup blocked...).
+// Prefer the exact web app that started the payment (Origin header, must be in our CORS allow-list), because the
+// return page needs that app's own login session. Fall back to the per-route env var, then to the admin site.
+// (FRONTEND_URL is a comma separated LIST, so it must never be used as-is inside a URL.)
+const WEB_ORIGINS = (process.env.FRONTEND_URL || 'https://admin.schooloffice.tech,https://teachers.schooloffice.tech,https://student.schooloffice.tech')
+  .split(',').map((o) => o.trim()).filter((o) => /^https:\/\/[^/?#\s]+$/.test(o) && !/localhost|csb\.app/.test(o));
+const resolveReturnOrigin = (req) => {
+  const hdr = req.headers && req.headers.origin;
+  if (hdr && WEB_ORIGINS.includes(hdr)) return hdr;
+  const fromRoute = String(req.appOrigin || '').split(',')[0].trim().replace(/\/$/, '');
+  if (/^https:\/\/[^/?#\s]+$/.test(fromRoute)) return fromRoute;
+  return WEB_ORIGINS[0] || 'https://admin.schooloffice.tech';
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SHARED: writes one payment into fee_payments + related tables.
 // Both Razorpay and Cashfree call this AFTER their own gateway-specific
@@ -49,8 +91,24 @@ async function recordFeePayment({
 
   const paymentId = uuidv4();
   let generatedReceipt = '';
+  let duplicate = null;
 
   await withTransaction(async (tx) => {
+    // 0. Idempotency: the same gateway payment must never be recorded twice (double click, retry, return-page + in-page
+    //    verify both firing, replayed request...). UPDLOCK+HOLDLOCK makes two concurrent verifies of one payment queue up.
+    const dupReq = tx.request();
+    dupReq.input('sid', sql.UniqueIdentifier, schoolId);
+    dupReq.input('gw', sql.VarChar(50), gateway);
+    dupReq.input('rpid', sql.NVarChar(200), gateway_payment_id);
+    const dupRes = await dupReq.query(`
+      SELECT TOP 1 id, receipt_no FROM fee_payments WITH (UPDLOCK, HOLDLOCK)
+      WHERE school_id = @sid AND gateway = @gw AND razorpay_payment_id = @rpid
+    `);
+    if (dupRes.recordset && dupRes.recordset.length > 0) {
+      duplicate = dupRes.recordset[0];
+      return;
+    }
+
     // 1. Ensure Fee Account exists
     const sReq = tx.request();
     sReq.input('sid', sql.UniqueIdentifier, schoolId);
@@ -192,6 +250,8 @@ async function recordFeePayment({
       console.warn(`Audit Logging Warning (${gateway}):`, logErr.message);
     }
   });
+
+  if (duplicate) return { id: duplicate.id, receipt_no: duplicate.receipt_no, duplicate: true };
 
   // Fire and forget Notifications
   require('../services/receiptService').sendPaymentConfirmationWhatsapp(schoolId, paymentId);
@@ -357,10 +417,9 @@ exports.createCashfreeOrder = async (req, res, next) => {
           customer_email: student.guardian_email || 'admin@schooloffice.tech',
         },
         order_meta: {
-          // return_url differs per calling app (admin vs student), set by the
-          // route layer on req.appOrigin before this controller runs. Falls
-          // back to FRONTEND_URL / a safe default if not set for some reason.
-          return_url: `${req.appOrigin || process.env.FRONTEND_URL || 'https://admin.schooloffice.tech'}/fees/cashfree-return?order_id={order_id}`,
+          // After a redirect-style payment (UPI app / 3-D Secure / popup blocked) Cashfree sends the browser here.
+          // The web app that started the payment must handle /fees/cashfree-return and call /cashfree/verify.
+          return_url: `${resolveReturnOrigin(req)}/fees/cashfree-return?order_id={order_id}`,
         },
         order_note: (breakdown && breakdown.length > 0) ? 'itemized' : 'lump_sum',
       }),
@@ -368,7 +427,7 @@ exports.createCashfreeOrder = async (req, res, next) => {
 
     const cfData = await cfRes.json();
     if (!cfRes.ok) {
-      console.error('[Cashfree create-order error]', JSON.stringify(cfData)); // 🔴 temp debug
+      console.error(`[Cashfree create-order] HTTP ${cfRes.status}`, JSON.stringify(cfData));
       return badRequest(res, cfData?.message || 'Could not create Cashfree order');
     }
 
@@ -385,34 +444,72 @@ exports.createCashfreeOrder = async (req, res, next) => {
 };
 
 // ── POST /api/payments/cashfree/verify ──────────────────────────────────────
-// Cashfree's checkout doesn't hand the client a signed proof the way
-// Razorpay does, so instead of trusting anything from the browser we ask
-// Cashfree directly (server-to-server, using our secret key) what the real
-// status of the order is, and only record the payment if THAT says success.
+// Cashfree's checkout doesn't hand the client a signed proof the way Razorpay does, so we never trust the browser:
+// we ask Cashfree directly (server-to-server) and only record the payment if THEY say it succeeded.
+//   1. GET /orders/{id}            -> whose order is it (customer_id == student_id), same school
+//   2. GET /orders/{id}/payments   -> polled, because PENDING -> SUCCESS can take a few seconds (UPI / netbanking)
+//   3. recordFeePayment()          -> idempotent per cf_payment_id, so retries / return-page / double clicks are safe
+// HTTP codes the apps rely on:  200 recorded (or already recorded) | 409 still processing, try again | 400 failed / invalid
 exports.verifyCashfreePayment = async (req, res, next) => {
   try {
     const { schoolId, userId, fullName: userName } = req.user;
-    const { cf_order_id, student_id, amount_paise, invoice_id, remarks, breakdown } = req.body;
+    const { cf_order_id, student_id: bodyStudentId, invoice_id, remarks, breakdown } = req.body;
 
-    if (!cf_order_id) return badRequest(res, 'Missing cf_order_id');
-
-    const cfRes = await fetch(`${CASHFREE_BASE_URL}/orders/${cf_order_id}/payments`, {
-      method: 'GET',
-      headers: cashfreeHeaders(),
-    });
-    const payments = await cfRes.json();
-    if (!cfRes.ok || !Array.isArray(payments)) {
-      return badRequest(res, 'Could not verify payment with Cashfree');
+    if (!cf_order_id || !CF_ORDER_ID_RE.test(String(cf_order_id))) {
+      return badRequest(res, 'Missing or invalid cf_order_id');
     }
 
-    const successfulPayment = payments.find((p) => p.payment_status === 'SUCCESS');
+    // 1. The order must exist and belong to the student this payment is being recorded for.
+    const orderRes = await cashfreeGet(`/orders/${cf_order_id}`);
+    if (!orderRes.ok || !orderRes.body) {
+      return badRequest(res, 'Could not fetch this order from Cashfree. Please try again in a moment.');
+    }
+    const orderStudentId = orderRes.body.customer_details && orderRes.body.customer_details.customer_id;
+    if (!orderStudentId) return badRequest(res, 'This Cashfree order is not linked to a student.');
+    if (bodyStudentId && String(bodyStudentId).toLowerCase() !== String(orderStudentId).toLowerCase()) {
+      return badRequest(res, 'This payment does not belong to the selected student.');
+    }
+    const student_id = orderStudentId; // also covers the return page, which may not know the student id
+
+    const student = await queryOne(
+      `SELECT id FROM students WHERE id=@uid AND school_id=@sid AND deleted_at IS NULL`,
+      { uid: { type: sql.UniqueIdentifier, value: student_id },
+        sid: { type: sql.UniqueIdentifier, value: schoolId } }
+    );
+    if (!student) return notFound(res, 'Student not found');
+
+    // 2. Ask Cashfree for the real payment status (poll while it is still PENDING).
+    let successfulPayment = null;
+    let payments = [];
+    for (let attempt = 1; attempt <= CF_VERIFY_ATTEMPTS; attempt++) {
+      const payRes = await cashfreeGet(`/orders/${cf_order_id}/payments`);
+      if (payRes.ok && Array.isArray(payRes.body)) {
+        payments = payRes.body;
+        successfulPayment = payments.find((p) => p.payment_status === 'SUCCESS');
+        if (successfulPayment) break;
+        // Nothing can still turn successful: all attempts failed/cancelled, or nothing was attempted at all.
+        if (payments.length > 0 && payments.every((p) => CF_TERMINAL_FAIL.has(p.payment_status))) break;
+        if (payments.length === 0 && attempt >= 2) break;
+      } else if (attempt === CF_VERIFY_ATTEMPTS) {
+        return badRequest(res, 'Could not verify payment with Cashfree. Please try again in a moment.');
+      }
+      if (attempt < CF_VERIFY_ATTEMPTS) await sleep(CF_VERIFY_DELAY_MS);
+    }
+
     if (!successfulPayment) {
-      return badRequest(res, 'Payment not completed for this order');
+      if (payments.length === 0) return badRequest(res, 'No payment was made for this order.');
+      if (payments.every((p) => CF_TERMINAL_FAIL.has(p.payment_status))) {
+        return badRequest(res, `Payment was not successful (status: ${payments[payments.length - 1].payment_status}).`);
+      }
+      // Still PENDING after waiting -> not a failure; the app should retry shortly.
+      return error(res, 'Payment is still being processed by Cashfree. Please check again in a minute.', 409);
     }
 
     // Prefer the amount Cashfree actually confirms over whatever the client sent.
-    const amt = Math.round(successfulPayment.payment_amount * 100) || Number(amount_paise) || 0;
+    const amt = Math.round(Number(successfulPayment.payment_amount) * 100);
+    if (!amt || amt <= 0) return badRequest(res, 'Cashfree returned an invalid payment amount.');
 
+    // 3. Record (idempotent per cf_payment_id).
     const result = await recordFeePayment({
       schoolId, userId, userName, student_id, amount_paise: amt, invoice_id, remarks, breakdown,
       payment_method: (successfulPayment.payment_group || '').toLowerCase() === 'upi' ? 'UPI' : 'Card',
@@ -422,6 +519,11 @@ exports.verifyCashfreePayment = async (req, res, next) => {
       gateway_signature: null,
     });
 
-    return success(res, result, `Payment of ₹${(amt / 100).toFixed(2)} verified & recorded`);
+    return success(
+      res, result,
+      result.duplicate
+        ? `Payment of ₹${(amt / 100).toFixed(2)} was already recorded`
+        : `Payment of ₹${(amt / 100).toFixed(2)} verified & recorded`
+    );
   } catch (err) { next(err); }
 };
