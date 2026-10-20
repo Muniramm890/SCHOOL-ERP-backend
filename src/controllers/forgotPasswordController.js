@@ -7,7 +7,8 @@ const { sendWhatsAppOtp } = require('../utils/whatsapp');
 const { sendHtmlEmail } = require('../services/emailService');
 const { logAudit } = require('../utils/auditLogger');
 
-const secret = 'my_super_secret_key_2026_xyz'; // Same secret as authController for now
+
+const secret = process.env.JWT_SECRET; 
 
 // ── 1. Send OTP (WhatsApp or Email) ────────────────────────────────────────
 // body: { identifier: "phone or email", method: "whatsapp" | "email" }
