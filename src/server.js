@@ -106,6 +106,7 @@ app.use(`${API}/exams`,         moduleGate(['exams', 'results']),               
 app.use(`${API}/notices`,       require('./routes/notices'));
 app.use(`${API}/notifications`, require('./routes/notifications'));
 app.use(`${API}/inbox`,         require('./routes/inbox'));
+app.use(`${API}/device-tokens`, require('./routes/deviceTokens'));
 app.use(`${API}/comm`,          moduleGate('commhub',  { 'GET /messages/:id': 'open' }),   require('./routes/commHub'));
 app.use(`${API}/homework`,      moduleGate('homework', { 'GET /mine': 'skip' }),           require('./routes/homework'));
 app.use('/api/attendance',      moduleGate('attendance', { 'GET /staff/roster': ['attendance', 'dashboard'] }), require('./routes/attendance'));
@@ -121,6 +122,7 @@ app.use(`${API}/student/payments`,    require('./routes/student/Payments'));
 app.use(`${API}/student/results`,     require('./routes/student/Results'));
 app.use(`${API}/student/dashboard`,   require('./routes/student/Dashboard'));
 app.use(`${API}/student/inbox`,       require('./routes/student/Inbox'));
+app.use(`${API}/student/device-tokens`, require('./routes/student/DeviceTokens'));
 app.use(`${API}/student/quick-tests`, require('./routes/student/QuickTests'));
 
 // ── 404 ────────────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
 const ctrl = require('../../controllers/studentInboxController');
 const { authenticateStudent } = require('../../middleware/studentAuth');
+const { uploadChatMedia } = require('../../middleware/upload');
 
 const replyLimiter = rateLimit({
   windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
@@ -16,6 +17,6 @@ router.get('/', ctrl.list);
 router.get('/unread-count', ctrl.unreadCount);
 router.get('/:messageId', ctrl.getConversation);
 router.get('/:messageId/replies', ctrl.pollReplies);
-router.post('/:messageId/reply', replyLimiter, ctrl.reply);
+router.post('/:messageId/reply', replyLimiter, uploadChatMedia, ctrl.reply);
 
 module.exports = router;

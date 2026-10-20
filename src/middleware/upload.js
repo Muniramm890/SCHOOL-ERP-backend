@@ -25,5 +25,19 @@ const uploadCommAttachment = multer({
   },
 });
 
+
+// 🔴 Chat media: ek reply = ek file (photo / video / document). Role-wise size caps chatService.classifyUpload me check hote hain.
+const uploadChatMediaMulter = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024, files: 1 },
+}).single('file');
+const uploadChatMedia = (req, res, next) =>
+  uploadChatMediaMulter(req, res, (err) => {
+    if (!err) return next();
+    const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File is too large (max 50 MB)' : err.message || 'Upload failed';
+    return res.status(400).json({ success: false, message: msg });
+  });
+
 module.exports = upload;
 module.exports.uploadCommAttachment = uploadCommAttachment;
+module.exports.uploadChatMedia = uploadChatMedia;

@@ -10,6 +10,8 @@ const { success, created, notFound, badRequest, forbidden } = require('../utils/
 const chat = require('../services/chatService');
 
 const U = (v) => ({ type: sql.UniqueIdentifier, value: v });
+// "📷 Photo" etc. when the last reply is only a file
+const LAST_REPLY_PREVIEW = `COALESCE(NULLIF(cr.body, ''), CASE cr.kind WHEN 'image' THEN N'📷 Photo' WHEN 'video' THEN N'🎥 Video' WHEN 'file' THEN N'📄 Document' ELSE cr.body END)`;
 const UNREAD_SQL = `(r.seen_at IS NULL OR (r.last_admin_reply_at IS NOT NULL
                      AND (r.recipient_last_read_at IS NULL OR r.last_admin_reply_at > r.recipient_last_read_at)))`;
 
@@ -33,7 +35,7 @@ exports.list = async (req, res, next) => {
          FROM comm_recipients r
          JOIN comm_messages m ON m.id = r.message_id AND m.school_id = r.school_id
          JOIN users u ON u.id = m.created_by
-         OUTER APPLY (SELECT TOP 1 cr.body, cr.sender_side FROM comm_replies cr
+         OUTER APPLY (SELECT TOP 1 ${LAST_REPLY_PREVIEW} AS body, cr.sender_side FROM comm_replies cr
                       WHERE cr.school_id=r.school_id AND cr.recipient_id=r.id AND cr.deleted_at IS NULL
                       ORDER BY cr.seq DESC) la
          WHERE r.school_id=@sid AND r.recipient_type='student' AND r.student_id=@stid AND m.deleted_at IS NULL
@@ -43,6 +45,7 @@ exports.list = async (req, res, next) => {
        ORDER BY last_activity_at DESC`,
       { sid: U(schoolId), stid: U(studentId), limit: { type: sql.Int, value: limit }, before: { type: sql.DateTime2, value: before } }
     );
+    chat.markDeliveredForRecipient({ schoolId, studentId }).catch(() => {}); // app is awake -> ✓✓
     return success(res, rows.recordset);
   } catch (err) { next(err); }
 };
@@ -51,6 +54,7 @@ exports.list = async (req, res, next) => {
 exports.unreadCount = async (req, res, next) => {
   try {
     const { studentId, schoolId } = req.student;
+    chat.markDeliveredForRecipient({ schoolId, studentId }).catch(() => {});
     const r = await queryOne(
       `SELECT COUNT(*) AS cnt
        FROM comm_recipients r
@@ -75,11 +79,6 @@ async function markOpened(schoolId, studentId, recipientId, messageId) {
   );
 }
 
-const REPLIES_SQL = `SELECT cr.seq, cr.id, cr.sender_side, cr.kind, cr.body, cr.created_at,
-                            CASE WHEN cr.sender_side='admin' THEN su.full_name ELSE NULL END AS sender_name
-                     FROM comm_replies cr LEFT JOIN users su ON su.id = cr.sender_user_id
-                     WHERE cr.school_id=@sid AND cr.recipient_id=@rid AND cr.deleted_at IS NULL`;
-
 // GET /api/student/inbox/:messageId  -> announcement + my thread (marks it read, like a chat app)
 exports.getConversation = async (req, res, next) => {
   try {
@@ -102,16 +101,18 @@ exports.getConversation = async (req, res, next) => {
        WHERE message_id=@mid AND school_id=@sid`,
       { mid: U(messageId), sid: U(schoolId) }
     );
-    const replies = await query(`${REPLIES_SQL} ORDER BY cr.seq`, { sid: U(schoolId), rid: U(rcp.id) });
+    const replies = await chat.selectReplies({ schoolId, recipientId: rcp.id });
 
     await markOpened(schoolId, studentId, rcp.id, messageId);
+    await chat.markRead({ schoolId, recipientId: rcp.id, senderSide: 'admin' });
 
     return success(res, {
       ...msg,
       can_reply: chat.canReplyNow(msg),
       attachments: attachments.recordset,
-      replies: replies.recordset,
-      last_seq: replies.recordset.length ? replies.recordset[replies.recordset.length - 1].seq : 0,
+      replies,
+      receipts: await chat.receiptsFor({ schoolId, recipientId: rcp.id, mySide: 'recipient' }),
+      last_seq: replies.length ? replies[replies.length - 1].seq : 0,
     });
   } catch (err) { next(err); }
 };
@@ -125,10 +126,10 @@ exports.pollReplies = async (req, res, next) => {
     const rcp = await chat.getMyStudentRecipient(schoolId, studentId, messageId);
     if (!rcp) return notFound(res, 'Conversation not found');
 
-    const rows = await query(`${REPLIES_SQL} AND cr.seq > @since ORDER BY cr.seq`,
-      { sid: U(schoolId), rid: U(rcp.id), since: { type: sql.BigInt, value: since } });
-    if (rows.recordset.some((r) => r.sender_side === 'admin')) await markOpened(schoolId, studentId, rcp.id, messageId);
-    return success(res, { replies: rows.recordset });
+    const replies = await chat.selectReplies({ schoolId, recipientId: rcp.id, sinceSeq: since });
+    if (replies.some((r) => r.sender_side === 'admin')) await markOpened(schoolId, studentId, rcp.id, messageId);
+    await chat.markRead({ schoolId, recipientId: rcp.id, senderSide: 'admin' });
+    return success(res, { replies, receipts: await chat.receiptsFor({ schoolId, recipientId: rcp.id, mySide: 'recipient' }) });
   } catch (err) { next(err); }
 };
 
@@ -138,7 +139,7 @@ exports.reply = async (req, res, next) => {
     const { studentId, schoolId } = req.student;
     const { messageId } = req.params;
     const body = chat.cleanBody(req.body?.body);
-    if (!body) return badRequest(res, 'Reply cannot be empty');
+    if (!body && !req.file) return badRequest(res, 'Reply cannot be empty');
     if (body.length > chat.MAX_REPLY_LEN) return badRequest(res, `Reply is too long (max ${chat.MAX_REPLY_LEN} characters)`);
     const clientMsgId = req.body?.client_msg_id ? String(req.body.client_msg_id).slice(0, 40) : null;
 
@@ -152,11 +153,13 @@ exports.reply = async (req, res, next) => {
     if (!chat.canReplyNow(msg)) return forbidden(res, 'Replies are not allowed (or have been closed) for this message');
 
     // students are not rows in `users` -> sender_user_id stays NULL (allowed for the recipient side)
+    const media = await chat.prepareMedia(req, { schoolId, recipientId: rcp.id, isStudent: true });
     const reply = await chat.addReply({
-      schoolId, messageId, recipientId: rcp.id, side: 'recipient', senderUserId: null, body, clientMsgId,
+      schoolId, messageId, recipientId: rcp.id, side: 'recipient', senderUserId: null, body, clientMsgId, media,
     });
     if (!reply.duplicate) {
-      await chat.pingAdminSide({ schoolId, messageId, createdBy: msg.created_by, excludeUserId: null, title: msg.title, preview: body });
+      await chat.pingAdminSide({ schoolId, messageId, recipientId: rcp.id, createdBy: msg.created_by, excludeUserId: null,
+        title: msg.title, preview: chat.previewOf(reply.kind, body) });
     }
     return created(res, reply, 'Reply sent');
   } catch (err) { next(err); }

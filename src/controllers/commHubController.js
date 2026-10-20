@@ -4,6 +4,7 @@
 const { query, queryOne, withTransaction, sql } = require('../config/db');
 const { success, created, notFound, badRequest, forbidden, paginated } = require('../utils/response');
 const chat = require('../services/chatService');
+const push = require('../services/pushService');
 const { sendHtmlEmail } = require('../services/emailService');
 const { uploadCommAttachment } = require('../services/uploadService');
 const { logAudit } = require('../utils/auditLogger');
@@ -468,6 +469,16 @@ exports.createAndSend = async (req, res, next) => {
       st: { type: sql.VarChar(20), value: finalStatus }, id: { type: sql.UniqueIdentifier, value: txResult.msgId },
     });
 
+    // phone push (fire-and-forget): tap opens that announcement's chat
+    if (channels.includes('app')) {
+      push.send({
+        schoolId, title: String(title).slice(0, 100), body: String(body || '').slice(0, 160),
+        userIds: recipients.filter((r) => r.recipient_type === 'staff' && r.user_id && String(r.user_id).toLowerCase() !== String(userId).toLowerCase()).map((r) => r.user_id),
+        studentIds: recipients.filter((r) => r.recipient_type === 'student').map((r) => r.student_id),
+        data: { type: 'chat', side: 'recipient', messageId: txResult.msgId },
+      }).catch(() => {});
+    }
+
     logAudit({ schoolId, userId, actionType: 'COMM_MESSAGE_SENT', details: JSON.stringify({ messageId: txResult.msgId, recipients: recipients.length, channels, attachments: uploadedAttachments.length }) });
 
     return created(res, { id: txResult.msgId, status: finalStatus, recipient_count: recipients.length, attachment_count: uploadedAttachments.length });
@@ -524,7 +535,7 @@ exports.listThreads = async (req, res, next) => {
        FROM comm_recipients r
        LEFT JOIN users u ON u.id = r.user_id
        LEFT JOIN students s ON s.id = r.student_id
-       OUTER APPLY (SELECT TOP 1 cr.body, cr.sender_side FROM comm_replies cr
+       OUTER APPLY (SELECT TOP 1 COALESCE(NULLIF(cr.body, ''), CASE cr.kind WHEN 'image' THEN N'📷 Photo' WHEN 'video' THEN N'🎥 Video' WHEN 'file' THEN N'📄 Document' ELSE cr.body END) AS body, cr.sender_side FROM comm_replies cr
                     WHERE cr.school_id=r.school_id AND cr.recipient_id=r.id AND cr.deleted_at IS NULL ORDER BY cr.seq DESC) la
        WHERE r.message_id=@id AND r.school_id=@sid AND r.reply_count > 0
          ${unansweredOnly ? "AND r.last_recipient_reply_at IS NOT NULL AND (r.last_admin_reply_at IS NULL OR r.last_recipient_reply_at > r.last_admin_reply_at)" : ''}
@@ -548,20 +559,16 @@ exports.getThread = async (req, res, next) => {
     const rcp = await loadThreadRecipient(schoolId, id, recipientId);
     if (!rcp) return notFound(res, 'Thread not found');
 
-    const replies = await query(
-      `SELECT cr.seq, cr.id, cr.sender_side, cr.kind, cr.body, cr.created_at, su.full_name AS sender_name
-       FROM comm_replies cr LEFT JOIN users su ON su.id = cr.sender_user_id
-       WHERE cr.school_id=@sid AND cr.recipient_id=@rid AND cr.deleted_at IS NULL AND cr.seq > @since
-       ORDER BY cr.seq`,
-      { sid: { type: sql.UniqueIdentifier, value: schoolId }, rid: { type: sql.UniqueIdentifier, value: recipientId }, since: { type: sql.BigInt, value: since } }
-    );
+    const replies = await chat.selectReplies({ schoolId, recipientId, sinceSeq: since, nameAll: true });
     await query(`UPDATE comm_recipients SET admin_last_read_at = SYSUTCDATETIME() WHERE id=@rid AND school_id=@sid`,
       { rid: { type: sql.UniqueIdentifier, value: recipientId }, sid: { type: sql.UniqueIdentifier, value: schoolId } });
+    await chat.markRead({ schoolId, recipientId, senderSide: 'recipient' });
 
     return success(res, {
       recipient: { recipient_id: rcp.id, name: rcp.name, recipient_type: rcp.recipient_type },
       message: { id: msg.id, title: msg.title, allow_replies: !!msg.allow_replies },
-      replies: replies.recordset,
+      replies,
+      receipts: await chat.receiptsFor({ schoolId, recipientId, mySide: 'admin' }),
     });
   } catch (err) { next(err); }
 };
@@ -572,7 +579,7 @@ exports.replyThread = async (req, res, next) => {
     const { schoolId, userId } = req.user;
     const { id, recipientId } = req.params;
     const body = chat.cleanBody(req.body?.body);
-    if (!body) return badRequest(res, 'Reply cannot be empty');
+    if (!body && !req.file) return badRequest(res, 'Reply cannot be empty');
     if (body.length > chat.MAX_REPLY_LEN) return badRequest(res, `Reply is too long (max ${chat.MAX_REPLY_LEN} characters)`);
     const clientMsgId = req.body?.client_msg_id ? String(req.body.client_msg_id).slice(0, 40) : null;
 
@@ -583,8 +590,9 @@ exports.replyThread = async (req, res, next) => {
     // admin may answer an existing thread, or reply on an announcement that has replies enabled
     if (!msg.allow_replies && !rcp.reply_count) return forbidden(res, 'Replies are not enabled for this announcement');
 
-    const reply = await chat.addReply({ schoolId, messageId: id, recipientId, side: 'admin', senderUserId: userId, body, clientMsgId });
-    if (!reply.duplicate) await chat.pingRecipient({ schoolId, recipient: rcp, messageId: id, title: msg.title, preview: body });
+    const media = await chat.prepareMedia(req, { schoolId, recipientId, isStudent: false });
+    const reply = await chat.addReply({ schoolId, messageId: id, recipientId, side: 'admin', senderUserId: userId, body, clientMsgId, media });
+    if (!reply.duplicate) await chat.pingRecipient({ schoolId, recipient: rcp, messageId: id, title: msg.title, preview: chat.previewOf(reply.kind, body) });
     return created(res, reply, 'Reply sent');
   } catch (err) { next(err); }
 };

@@ -43,12 +43,15 @@ const { generateBlobSASQueryParameters, BlobSASPermissions, StorageSharedKeyCred
 
 const connectionString = process.env.uploadhomework_string;
 const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
+// signed URLs need the account key: env var if set, otherwise the one inside the connection string
+const CONNECTION_ACCOUNT_KEY = (String(connectionString || '').match(/AccountKey=([^;]+)/) || [])[1];
 
 // ── Container registry — one BlobServiceClient, multiple logical containers ──
 const CONTAINERS = {
   homework: 'homeworksschooloffice',
   payslips: 'payslipsschooloffice', 
   commAttachments: 'commattachmentsschooloffice',
+  chatMedia: 'chatmediaschooloffice', // private: chat photos / videos / documents (always read through short-lived signed URLs)
 };
 const getContainerClient = (containerKey) => blobServiceClient.getContainerClient(CONTAINERS[containerKey]);
 
@@ -99,7 +102,7 @@ const getSignedDownloadUrl = (blobPath, expiryMinutes = 60, containerKey = 'home
     const targetContainerName = CONTAINERS[containerKey];
     const client = getContainerClient(containerKey);
     const accountName = blobServiceClient.accountName;
-    const accountKey = process.env.AZURE_STORAGE_KEY;
+    const accountKey = process.env.AZURE_STORAGE_KEY || CONNECTION_ACCOUNT_KEY;
     if (!accountKey) return client.getBlockBlobClient(blobPath).url;
 
     const sharedKeyCredential = new StorageSharedKeyCredential(accountName, accountKey);
@@ -130,4 +133,23 @@ const uploadCommAttachment = async (buffer, { schoolId, fileName, ext }) => {
   }
 };
 
-module.exports = { uploadImageBuffer, uploadBufferToAzure, uploadRawBuffer, uploadPayslipPdf, uploadCommAttachment, safeName, deleteBlobFromAzure, getSignedDownloadUrl };
+// 🔴 Chat media (photo / video / document) — chat/{schoolId}/{recipientId}/{timestamp}_{random}.{ext}
+const _ensured = {};
+const ensureContainer = async (key) => {
+  if (_ensured[key]) return;
+  await getContainerClient(key).createIfNotExists(); // private by default
+  _ensured[key] = true;
+};
+const uploadChatMedia = async (buffer, { schoolId, recipientId, ext, mime }) => {
+  try {
+    await ensureContainer('chatMedia');
+    const blobPath = `chat/${schoolId}/${recipientId}/${Date.now()}_${require('crypto').randomBytes(6).toString('hex')}${ext}`;
+    const blockBlobClient = getContainerClient('chatMedia').getBlockBlobClient(blobPath);
+    await blockBlobClient.upload(buffer, buffer.length, { blobHTTPHeaders: { blobContentType: mime } });
+    return { blobPath };
+  } catch (error) {
+    throw new Error(`Chat media upload failed: ${error.message}`);
+  }
+};
+
+module.exports = { uploadImageBuffer, uploadBufferToAzure, uploadRawBuffer, uploadPayslipPdf, uploadCommAttachment, uploadChatMedia, safeName, deleteBlobFromAzure, getSignedDownloadUrl };

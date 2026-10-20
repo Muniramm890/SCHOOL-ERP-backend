@@ -180,6 +180,17 @@ async function notifyViaCommHub(opts) {
     notified++;
   }
 
+  // phone push for every staff member whose in-app notice was written (fire-and-forget)
+  try {
+    const pushed = results.filter((r) => r.app && r.app.status === 'sent' && r.user_id).map((r) => r.user_id);
+    if (pushed.length) {
+      require('./pushService').send({
+        schoolId, userIds: pushed, title: String(title).slice(0, 100), body: String(body || '').slice(0, 160),
+        data: { type: 'chat', side: 'recipient', messageId: msgId },
+      }).catch(() => {});
+    }
+  } catch (_) { /* push must never break the notification flow */ }
+
   const finalStatus = anyFailedOverall && anySentOverall ? 'partial' : anyFailedOverall ? 'failed' : 'sent';
   await query(`UPDATE comm_messages SET status=@st WHERE id=@id`,
     { st: { type: sql.VarChar(20), value: finalStatus }, id: { type: sql.UniqueIdentifier, value: msgId } });
