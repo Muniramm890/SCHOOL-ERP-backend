@@ -41,10 +41,14 @@ const allowedOrigins = (process.env.FRONTEND_URL || 'https://admin.schooloffice.
 const nativeAppOrigins = ['https://localhost', 'http://localhost', 'capacitor://localhost', 'ionic://localhost'];
 nativeAppOrigins.forEach((o) => { if (!allowedOrigins.includes(o)) allowedOrigins.push(o); });
 
+// koi bhi https://<anything>.schooloffice.tech (admin / teachers / student / app ... ) hamesha allowed
+const schoolOfficeSubdomain = /^https:\/\/([a-z0-9-]+\.)*schooloffice\.tech$/i;
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS: ${origin} not allowed`));
+    if (!origin || allowedOrigins.includes(origin) || schoolOfficeSubdomain.test(origin)) return cb(null, true);
+    // Azure Log stream me dikhega: kaunsa web address block hua (FRONTEND_URL me jodna ho to yahi value)
+    console.warn(`[cors] blocked origin: ${origin}`);
+    cb(null, false);
   },
   credentials: true,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
