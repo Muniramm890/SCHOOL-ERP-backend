@@ -3,14 +3,12 @@ const router = require('express').Router();
 const ctrl = require('../../controllers/studentAuthController');
 const forgotCtrl = require('../../controllers/studentForgotPasswordController');
 const { authenticateStudent } = require('../../middleware/studentAuth');
-const rateLimit = require('express-rate-limit');
-
-const otpLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 3, message: { success: false, message: 'Too many OTP requests.' } });
+const { otpSend, otpVerify, otpVerifyByIp } = require('../../middleware/rateLimiter'); // OTP send / guess limits
 
 router.post('/login', ctrl.login);
-router.post('/forgot-password/send-otp', otpLimiter, forgotCtrl.sendResetOtp);
-router.post('/forgot-password/verify-otp', forgotCtrl.verifyResetOtp);
-router.post('/forgot-password/reset', forgotCtrl.resetPassword);
+router.post('/forgot-password/send-otp', ...otpSend, forgotCtrl.sendResetOtp);
+router.post('/forgot-password/verify-otp', ...otpVerify, forgotCtrl.verifyResetOtp);
+router.post('/forgot-password/reset', otpVerifyByIp, forgotCtrl.resetPassword);
 
 router.get('/me', authenticateStudent, ctrl.me);
 router.put('/me', authenticateStudent, ctrl.updateProfile);

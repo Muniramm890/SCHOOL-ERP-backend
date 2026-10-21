@@ -9,6 +9,7 @@ const { logAudit } = require('../utils/auditLogger');
 
 
 const secret = process.env.JWT_SECRET; 
+const { generateOtp } = require('../utils/otp');
 
 // ── 1. Send OTP (WhatsApp or Email) ────────────────────────────────────────
 // body: { identifier: "phone or email", method: "whatsapp" | "email" }
@@ -30,12 +31,12 @@ exports.sendResetOtp = async (req, res, next) => {
       identifier: { type: sql.NVarChar(255), value: identifier }
     });
 
-    if (!user) {
-      return res.status(404).json({ success: false, message: `No account found with this ${method === 'email' ? 'email' : 'phone number'}` });
-    }
-    if (!user.is_active) {
-      return res.status(403).json({ success: false, message: 'This account is inactive. Please contact your school admin.' });
-    }
+    // Same answer whether or not the account exists / is active, so this endpoint can't be used to find out who has an account.
+    const generic = {
+      success: true,
+      message: `If an account exists for this ${method === 'email' ? 'email' : 'phone number'}, a verification code has been sent.`,
+    };
+    if (!user || !user.is_active) return res.json(generic);
 
     // Clean up expired + any existing OTP for this identifier
     await query(`DELETE FROM OtpVerifications WHERE ExpiresAt < GETUTCDATE()`);
@@ -43,7 +44,7 @@ exports.sendResetOtp = async (req, res, next) => {
       identifier: { type: sql.VarChar, value: identifier }
     });
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = generateOtp();
 
     await query(`
       INSERT INTO OtpVerifications (Phone, Otp, ExpiresAt, CreatedAt)
@@ -75,11 +76,11 @@ exports.sendResetOtp = async (req, res, next) => {
         });
       }
     } catch (deliveryErr) {
+      // Logged only: a different response here would reveal that the account exists. The user can simply request a new code.
       console.error('OTP delivery failed:', deliveryErr);
-      return res.status(500).json({ success: false, message: `Failed to send code via ${method}. Please try again.` });
     }
 
-    return res.json({ success: true, message: `Verification code sent via ${method === 'whatsapp' ? 'WhatsApp' : 'email'}` });
+    return res.json(generic);
   } catch (err) { next(err); }
 };
 

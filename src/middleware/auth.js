@@ -19,6 +19,8 @@ const authenticate = async (req, res, next) => {
     // Verification mein bhi wahi string use karein
 const secretKey = process.env.JWT_SECRET; 
 const decoded = jwt.verify(token, secretKey);
+    // Only real access tokens: refresh tokens (30 days) and password-reset tokens are signed with the same secret.
+    if (decoded.type === 'refresh' || decoded.purpose) return unauthorized(res, 'Invalid token type');
     // Fetch live user + school member record
     const member = await queryOne(
       `SELECT sm.id AS member_id, sm.school_id, sm.user_id, sm.role, sm.permissions, sm.is_active,

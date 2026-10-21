@@ -1,5 +1,14 @@
 // src/server.js
 require('dotenv').config();
+
+// Fail fast: without a JWT secret every login / reset token would be signed with `undefined`.
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET environment variable is not set. Refusing to start.');
+  process.exit(1);
+}
+if (process.env.JWT_SECRET.length < 32) {
+  console.warn('WARNING: JWT_SECRET is shorter than 32 characters. Use a long random value.');
+}
 const express    = require('express');
 const cors       = require('cors');
 const helmet     = require('helmet');

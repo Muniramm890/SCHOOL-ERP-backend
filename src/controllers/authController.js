@@ -8,11 +8,11 @@ const { logAudit } = require('../utils/auditLogger');
 // ── Helpers ────────────────────────────────────────────────────────────────
 // Hardcode the secret for testing right now
 const secret = process.env.JWT_SECRET; 
-const signToken = (payload) => jwt.sign(payload, secret, { expiresIn: '24h' });
+const signToken = (payload) => jwt.sign({ ...payload, type: 'access' }, secret, { expiresIn: '24h' });
  // 👈 Direct string for testing
 
 const signRefresh = (payload) => 
-  jwt.sign(payload, secret, { expiresIn: '30d' }); // 👈 Direct string for testing
+  jwt.sign({ ...payload, type: 'refresh' }, secret, { expiresIn: '30d' }); // `type` stops a refresh token being used as an access token
 
 // ── POST /api/auth/login ───────────────────────────────────────────────────
 exports.login = async (req, res, next) => {
@@ -224,11 +224,15 @@ exports.refresh = async (req, res, next) => {
     if (!refreshToken) return badRequest(res, 'Refresh token required');
 
     const decoded = jwt.verify(refreshToken, secret);
+    // An access token must never be able to renew itself forever. (Refresh tokens issued before this change have no `type`
+    // and keep working until they expire.)
+    if (decoded.type === 'access') return unauthorized(res, 'Invalid refresh token');
     const token = signToken({ userId: decoded.userId, schoolId: decoded.schoolId, role: decoded.role, fullName: decoded.fullName });
     
     return success(res, { token });
   } catch (err) {
     if (err.name === 'TokenExpiredError') return unauthorized(res, 'Refresh token expired. Please log in again.');
+    if (err.name === 'JsonWebTokenError') return unauthorized(res, 'Invalid refresh token');
     next(err);
   }
 };

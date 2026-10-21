@@ -6,8 +6,8 @@ const { success, badRequest, notFound } = require('../utils/response');
 // ⚠️ Aapke signupController.js mein jo WhatsApp OTP sender use ho raha hai wahi yahan import karo
 // const { sendWhatsappOtp } = require('../services/whatsappService');
 
-const secret = 'my_super_secret_key_2026_xyz';
-const genOtp = () => String(Math.floor(100000 + Math.random() * 900000));
+const secret = process.env.JWT_SECRET; // never hardcode: this repo is public
+const { generateOtp: genOtp } = require('../utils/otp');
 
 // POST /api/student/auth/forgot-password/send-otp   Body: { phone }
 exports.sendResetOtp = async (req, res, next) => {
@@ -18,7 +18,9 @@ exports.sendResetOtp = async (req, res, next) => {
     const cred = await queryOne(`SELECT id FROM student_credentials WHERE login_phone=@ph AND deleted_at IS NULL`, {
       ph: { type: sql.VarChar(20), value: phone.trim() },
     });
-    if (!cred) return notFound(res, 'No student account found with this phone number');
+    // Same answer whether or not the number is registered (prevents account enumeration)
+    const generic = 'If this phone number is registered, an OTP has been sent.';
+    if (!cred) return success(res, null, generic);
 
     const otp = genOtp();
     await query(
@@ -28,7 +30,7 @@ exports.sendResetOtp = async (req, res, next) => {
     );
 
     // await sendWhatsappOtp(phone, otp);
-    return success(res, null, 'OTP sent to your WhatsApp');
+    return success(res, null, generic);
   } catch (err) { next(err); }
 };
 
@@ -47,6 +49,12 @@ exports.verifyResetOtp = async (req, res, next) => {
     );
     if (!row) return badRequest(res, 'Invalid or expired OTP');
 
+    // Burn the OTP so one code can only ever produce one reset token
+    await query(
+      `DELETE FROM OtpVerifications WHERE Phone=@ph AND Purpose='FORGOT_PASSWORD' AND ActorType='student'`,
+      { ph: { type: sql.VarChar(15), value: phone.trim() } }
+    );
+
     const resetToken = jwt.sign({ phone: phone.trim(), purpose: 'reset' }, secret, { expiresIn: '10m' });
     return success(res, { resetToken });
   } catch (err) { next(err); }
@@ -58,6 +66,8 @@ exports.resetPassword = async (req, res, next) => {
     const { resetToken, newPassword } = req.body;
     if (!resetToken || !newPassword) return badRequest(res, 'resetToken and newPassword are required');
 
+    if (String(newPassword).length < 6) return badRequest(res, 'Password must be at least 6 characters');
+
     const decoded = jwt.verify(resetToken, secret);
     if (decoded.purpose !== 'reset') return badRequest(res, 'Invalid reset token');
 
@@ -68,7 +78,7 @@ exports.resetPassword = async (req, res, next) => {
     });
     return success(res, null, 'Password reset successfully');
   } catch (err) {
-    if (err.name === 'TokenExpiredError') return badRequest(res, 'Reset session expired, please request OTP again');
+    if (err.name === 'TokenExpiredError' || err.name === 'JsonWebTokenError') return badRequest(res, 'Reset session expired or invalid, please request OTP again');
     next(err);
   }
 };

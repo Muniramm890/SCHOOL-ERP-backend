@@ -32,7 +32,7 @@ const sendOtp = async (req, res, next) => {
     });
 
     // 🔴 Generate 6-Digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = require('../utils/otp').generateOtp();
 
     // 🔴 Insert OTP (Using GETUTCDATE() for Azure Timezone safety)
     const insertQuery = `
@@ -170,7 +170,7 @@ const registerSchool = async (req, res, next) => {
     });
 
     // 7. Generate Auto-Login JWT
-    const secretKey = process.env.JWT_SECRET || 'my_super_secret_key_erp_2026';
+    const secretKey = process.env.JWT_SECRET; // no fallback: server.js refuses to start without it
     const token = jwt.sign({ schoolId, userId, role: 'school_admin' }, secretKey, { expiresIn: '24h' });
 
     return res.status(201).json({ 
