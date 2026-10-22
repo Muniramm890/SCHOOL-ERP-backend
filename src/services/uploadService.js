@@ -152,4 +152,31 @@ const uploadChatMedia = async (buffer, { schoolId, recipientId, ext, mime }) => 
   }
 };
 
-module.exports = { uploadImageBuffer, uploadBufferToAzure, uploadRawBuffer, uploadPayslipPdf, uploadCommAttachment, uploadChatMedia, safeName, deleteBlobFromAzure, getSignedDownloadUrl };
+// ── Read a blob that belongs to OUR storage account, given its URL (SAS or plain). Used by filesController (PDF viewer). ──
+const resolveBlobUrl = (u) => {
+  try {
+    if (String(u.hostname).toLowerCase() !== `${blobServiceClient.accountName}.blob.core.windows.net`.toLowerCase()) return null;
+    const parts = decodeURIComponent(u.pathname).split('/').filter(Boolean); // [container, ...blobPath]
+    const container = parts.shift();
+    if (!Object.values(CONTAINERS).includes(container) || !parts.length) return null;
+    return { container, blobPath: parts.join('/') };
+  } catch { return null; }
+};
+
+const downloadBlobBuffer = async (container, blobPath, maxBytes = 30 * 1024 * 1024) => {
+  try {
+    const dl = await blobServiceClient.getContainerClient(container).getBlobClient(blobPath).download();
+    const chunks = []; let size = 0;
+    for await (const c of dl.readableStreamBody) {
+      size += c.length;
+      if (size > maxBytes) throw Object.assign(new Error('File is too large'), { status: 413 });
+      chunks.push(c);
+    }
+    return Buffer.concat(chunks);
+  } catch (e) {
+    if (e && (e.statusCode === 404 || e.code === 'BlobNotFound')) throw Object.assign(new Error('Document not found'), { status: 404 });
+    throw e;
+  }
+};
+
+module.exports = { uploadImageBuffer, uploadBufferToAzure, uploadRawBuffer, uploadPayslipPdf, uploadCommAttachment, uploadChatMedia, safeName, deleteBlobFromAzure, getSignedDownloadUrl, resolveBlobUrl, downloadBlobBuffer };
