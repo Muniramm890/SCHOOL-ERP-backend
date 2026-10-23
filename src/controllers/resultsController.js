@@ -2,7 +2,7 @@
 const sql = require('mssql');
 const { query, queryOne, withTransaction } = require('../config/db');
 const { success, created, notFound, badRequest } = require('../utils/response');
-const { generateStudentReportCardPdf, generateBulkReportCardsPdf } = require('../services/resultCardService');
+const { reportCardPdf, bulkReportCardsPdf, sendPdf } = require('../services/documents');
 
 // ═══════════════════════════════════════════════════════════════
 // GET /api/results/exam-groups
@@ -532,8 +532,8 @@ exports.downloadReportCardPdf = async (req, res, next) => {
     const { exam_group_id } = req.query;
     if (!exam_group_id) return badRequest(res, 'exam_group_id is required');
 
-    const url = await generateStudentReportCardPdf(schoolId, studentId, exam_group_id);
-    return success(res, { url }, 'Report card PDF generated');
+    const { buffer, filename } = await reportCardPdf(schoolId, studentId, exam_group_id);
+    return sendPdf(res, buffer, filename);
   } catch (err) { next(err); }
 };
 
@@ -545,7 +545,9 @@ exports.downloadBulkReportCards = async (req, res, next) => {
     const { section_id, exam_group_id } = req.query;
     if (!section_id || !exam_group_id) return badRequest(res, 'section_id and exam_group_id are required');
 
-    const result = await generateBulkReportCardsPdf(schoolId, section_id, exam_group_id);
-    return success(res, result, `${result.count} report cards generated`);
+    const { buffer, filename, count } = await bulkReportCardsPdf(schoolId, section_id, exam_group_id);
+    res.setHeader('X-Report-Count', String(count));
+    res.setHeader('Access-Control-Expose-Headers', 'X-Report-Count');
+    return sendPdf(res, buffer, filename);
   } catch (err) { next(err); }
 };

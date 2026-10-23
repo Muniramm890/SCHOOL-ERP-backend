@@ -723,9 +723,9 @@ exports.listPayments = async (req, res, next) => {
 exports.getReceipt = async (req, res, next) => {
   try {
     const { schoolId } = req.user;
-    const { id } = req.params;
-    const receiptService = require('../services/receiptService');
-    const url = await receiptService.getOrGenerateReceipt(schoolId, id);
-    return success(res, { receipt_url: url }, 'Receipt ready');
+    const { receiptPdf, sendPdf } = require('../services/documents');
+    // student route: only their own receipts (req.student set by authenticateStudent)
+    const { buffer, filename } = await receiptPdf(schoolId, req.params.id, { studentId: req.student?.studentId });
+    return sendPdf(res, buffer, filename);
   } catch (err) { next(err); }
 };
