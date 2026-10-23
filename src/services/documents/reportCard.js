@@ -7,9 +7,18 @@ const U = (v) => ({ type: sql.UniqueIdentifier, value: v });
 const pct = (m, max) => (max > 0 && m !== null && m !== undefined && m !== '' ? `${((Number(m) / Number(max)) * 100).toFixed(1)}%` : '-');
 const FAIL = '#b91c1c';
 
+// exam_results.status holds 'pass' | 'fail' | 'incomplete' after computing, but publishing overwrites it with
+// 'published' / 'draft'. So the Pass/Fail shown on the card is derived from the marks (same rule as the result compute).
+function resultOf(overall, subjects) {
+  if (['pass', 'fail', 'incomplete'].includes(overall.status)) return overall.status;
+  const failed = subjects.some((s) => (s.status === 'absent') || (!s.is_grade_only && s.marks_obtained !== null && s.marks_obtained !== undefined && Number(s.marks_obtained) < Number(s.passing_marks)));
+  return failed ? 'fail' : 'pass';
+}
+
 // Official report card: full A4, single school theme, school text in header + footer
-function drawReportCardPage(doc, brand, { student, guardian, examName, overall, subjects, gradingScale, photo }) {
+function drawReportCardPage(doc, brand, { student, guardian, examName, overall, subjects, gradingScale, photo, publishedAt }) {
   const { width: W, height: H } = doc.page;
+  const result = resultOf(overall, subjects);
   let y = K.drawHeader(doc, brand);
   y = K.titleBand(doc, brand, y, 'Report Card', examName || 'Examination');
 
@@ -51,7 +60,7 @@ function drawReportCardPage(doc, brand, { student, guardian, examName, overall, 
     y = K.table(doc, brand, {
       y, rows, rowH: 18.5,
       cols: [{ label: 'No.', w: w[0] }, { label: 'Subject', w: w[1] }, { label: 'Max', w: w[2], align: 'center' }, { label: 'Pass', w: w[3], align: 'center' }, { label: 'Obtained', w: w[4], align: 'center' }, { label: 'Percent', w: w[5], align: 'center' }, { label: 'Result', w: w[6], align: 'center' }],
-      foot: [{ text: '' }, { text: 'GRAND TOTAL', bold: true }, { text: String(overall.max_total ?? '-'), bold: true }, { text: '' }, { text: String(overall.total_marks ?? '-'), bold: true }, { text: `${overall.percentage ?? '-'}%`, bold: true }, { text: (overall.status || '-').toUpperCase(), bold: true, color: overall.status === 'pass' ? brand.deep : FAIL }],
+      foot: [{ text: '' }, { text: 'GRAND TOTAL', bold: true }, { text: String(overall.max_total ?? '-'), bold: true }, { text: '' }, { text: String(overall.total_marks ?? '-'), bold: true }, { text: `${overall.percentage ?? '-'}%`, bold: true }, { text: result.toUpperCase(), bold: true, color: result === 'fail' ? FAIL : brand.deep }],
     });
     y += 13;
   }
@@ -63,14 +72,15 @@ function drawReportCardPage(doc, brand, { student, guardian, examName, overall, 
   }
 
   // ── result summary ──
-  const passed = overall.status === 'pass';
-  const cells = [['Percentage', `${overall.percentage ?? '-'}%`], ['Overall Grade', overall.grade || '-'], ['Class Rank', overall.class_rank ? `#${overall.class_rank}` : '-'], ['School Rank', overall.school_rank ? `#${overall.school_rank}` : '-'], ['Result', (overall.status || '-').toUpperCase()]];
+  const passed = result === 'pass', failed = result === 'fail';
+  const cells = [['Percentage', `${overall.percentage ?? '-'}%`], ['Overall Grade', overall.grade || '-'], ['Class Rank', overall.class_rank ? `#${overall.class_rank}` : '-'], ['School Rank', overall.school_rank ? `#${overall.school_rank}` : '-'], ['Result', result.toUpperCase()]];
   const cw = CW / cells.length, sh = 40;
   cells.forEach(([label, value], i) => {
     const x = M + i * cw, last = i === cells.length - 1;
-    doc.rect(x, y, cw, sh).fillAndStroke(last ? (passed ? brand.color : FAIL) : brand.softer, last ? (passed ? brand.color : FAIL) : LINE);
-    doc.font('Helvetica-Bold').fontSize(6.4).fillColor(last ? (passed ? brand.on : '#ffffff') : FAINT).text(label.toUpperCase(), x, y + 7, { width: cw, align: 'center', characterSpacing: 0.7, lineBreak: false });
-    doc.font('Times-Bold').fontSize(15).fillColor(last ? (passed ? brand.on : '#ffffff') : brand.deep).text(String(value), x, y + 18, { width: cw, align: 'center', lineBreak: false });
+    const rf = failed ? FAIL : brand.color;
+    doc.rect(x, y, cw, sh).fillAndStroke(last ? rf : brand.softer, last ? rf : LINE);
+    doc.font('Helvetica-Bold').fontSize(6.4).fillColor(last ? (failed ? '#ffffff' : brand.on) : FAINT).text(label.toUpperCase(), x, y + 7, { width: cw, align: 'center', characterSpacing: 0.7, lineBreak: false });
+    doc.font('Times-Bold').fontSize(15).fillColor(last ? (failed ? '#ffffff' : brand.on) : brand.deep).text(String(value), x, y + 18, { width: cw, align: 'center', lineBreak: false });
   });
   doc.rect(M, y, CW, sh).lineWidth(0.9).strokeColor(brand.color).stroke();
   y += sh + 12;
@@ -93,8 +103,8 @@ function drawReportCardPage(doc, brand, { student, guardian, examName, overall, 
   doc.rect(M, y, rw, rh).lineWidth(0.5).strokeColor(LINE).stroke();
   doc.font('Helvetica').fontSize(6.4).fillColor(FAINT).text("CLASS TEACHER'S REMARKS", M + 6, y + 4.5, { characterSpacing: 0.5, lineBreak: false });
   doc.rect(M + rw, y, CW - rw, rh).lineWidth(0.5).strokeColor(LINE).stroke();
-  doc.font('Helvetica').fontSize(6.4).fillColor(FAINT).text('DATE OF ISSUE', M + rw + 6, y + 4.5, { characterSpacing: 0.5, lineBreak: false });
-  doc.font('Helvetica-Bold').fontSize(9).fillColor(INK).text(K.fmtDate(new Date(), true), M + rw + 6, y + 15, { lineBreak: false });
+  doc.font('Helvetica').fontSize(6.4).fillColor(FAINT).text('RESULT PUBLISHED ON', M + rw + 6, y + 4.5, { characterSpacing: 0.5, lineBreak: false });
+  doc.font('Helvetica-Bold').fontSize(9).fillColor(INK).text(publishedAt ? K.fmtDate(publishedAt, true) : '-', M + rw + 6, y + 15, { lineBreak: false });
   y += rh;
 
   // ── signatures (a new page if the content ran long) ──
@@ -130,10 +140,12 @@ async function loadStudentCard(schoolId, studentId, examGroupId, overall) {
 async function loadCommon(schoolId, examGroupId) {
   const [brand, examGroup, scale] = await Promise.all([
     K.getBrand(schoolId),
-    queryOne(`SELECT name FROM exam_groups WHERE id=@id AND school_id=@sid`, { id: U(examGroupId), sid: U(schoolId) }),
+    queryOne(`SELECT name, status, updated_at FROM exam_groups WHERE id=@id AND school_id=@sid`, { id: U(examGroupId), sid: U(schoolId) }),
     query(`SELECT grade_label, min_percent, max_percent FROM grading_scale WHERE school_id=@sid ORDER BY sort_order`, { sid: U(schoolId) }),
   ]);
-  return { brand, examName: examGroup?.name, gradingScale: scale.recordset };
+  // no dedicated published_at column: publishing stamps exam_groups.updated_at
+  const publishedAt = examGroup && examGroup.status === 'published' ? examGroup.updated_at : null;
+  return { brand, examName: examGroup?.name, gradingScale: scale.recordset, publishedAt };
 }
 
 async function reportCardPdf(schoolId, studentId, examGroupId) {
@@ -145,7 +157,7 @@ async function reportCardPdf(schoolId, studentId, examGroupId) {
   if (!overall) throw K.httpError(404, 'Result not computed for this student yet');
   const [common, card] = await Promise.all([loadCommon(schoolId, examGroupId), loadStudentCard(schoolId, studentId, examGroupId, overall)]);
   const doc = K.createDoc(common.brand, { title: `Report Card - ${card.student.student_name}` });
-  drawReportCardPage(doc, common.brand, { ...card, examName: common.examName, gradingScale: common.gradingScale });
+  drawReportCardPage(doc, common.brand, { ...card, examName: common.examName, gradingScale: common.gradingScale, publishedAt: common.publishedAt });
   K.drawFooters(doc, common.brand, { ref: common.examName || '', pageNumbers: false });
   return { buffer: await K.finish(doc), filename: `ReportCard_${K.safeName(card.student.student_name)}_${K.safeName(common.examName)}` };
 }
@@ -164,7 +176,7 @@ async function bulkReportCardsPdf(schoolId, sectionId, examGroupId) {
   for (let i = 0; i < rows.length; i++) {
     const card = await loadStudentCard(schoolId, rows[i].student_id, examGroupId, rows[i]);
     if (i > 0) doc.addPage();
-    drawReportCardPage(doc, common.brand, { ...card, examName: common.examName, gradingScale: common.gradingScale });
+    drawReportCardPage(doc, common.brand, { ...card, examName: common.examName, gradingScale: common.gradingScale, publishedAt: common.publishedAt });
   }
   K.drawFooters(doc, common.brand, { ref: common.examName || '', pageNumbers: false });
   return { buffer: await K.finish(doc), count: rows.length, filename: `ReportCards_${K.safeName(common.examName)}_${rows.length}` };
