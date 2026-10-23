@@ -1,553 +1,333 @@
-
-const sql = require('mssql');
-const { query, queryOne, withTransaction } = require('../config/db');
-const { success, created, notFound, badRequest } = require('../utils/response');
+// src/controllers/resultsController.js  (v2)
+// Result compute engine + analytics + report cards.
+// exam_results.status is ONLY the outcome: pass | fail | incomplete (publish state lives in exam_groups.status).
+const { query, withTransaction, sql } = require('../config/db');
+const { success } = require('../utils/response');
+const R = require('../utils/examRules');
+const { handle, U, bad, notFound, conflict, forbidden } = R;
 const { reportCardPdf, bulkReportCardsPdf, sendPdf } = require('../services/documents');
 
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/exam-groups
-// List exam groups available for result analysis (selector at top
-// of the Results Hub)
-// ═══════════════════════════════════════════════════════════════
-exports.listExamGroups = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { academic_year_id } = req.query;
-    const result = await query(
-      `SELECT eg.id, eg.name, eg.exam_type, eg.status, eg.start_date, eg.end_date, eg.weightage_percent,
-              (SELECT COUNT(*) FROM exam_results er WHERE er.exam_group_id = eg.id) AS results_computed_count
-       FROM exam_groups eg
-       WHERE eg.school_id=@sid AND eg.deleted_at IS NULL
-         AND (@ayId IS NULL OR eg.academic_year_id=@ayId)
-       ORDER BY eg.start_date DESC`,
-      {
-        sid: { type: sql.UniqueIdentifier, value: schoolId },
-        ayId: { type: sql.UniqueIdentifier, value: academic_year_id || null },
-      }
-    );
-    return success(res, result.recordset, 'Exam groups fetched');
-  } catch (err) { next(err); }
+const pct2 = (n) => (n === null || n === undefined ? 0 : Math.round(Number(n) * 100) / 100);
+const ratio = (a, b) => (b > 0 ? Math.round((a / b) * 10000) / 100 : 0);
+const isStudent = (req) => !!req.student;
+
+// students may only see published exams; staff see everything
+async function examFor(req, examId) {
+  const exam = await R.loadExam(req.user.schoolId, examId);
+  if (isStudent(req) && exam.status !== 'published') throw forbidden('This result has not been published yet');
+  return exam;
+}
+const needExamParam = (req) => {
+  const id = req.query.exam_group_id;
+  if (!id) throw bad('exam_group_id is required');
+  return R.needUuid(id, 'exam_group_id');
 };
+// every analytics query joins the exam so deleted exams / other schools never leak in
+const EXAM_JOIN = `JOIN exam_groups eg ON eg.id = er.exam_group_id AND eg.school_id = er.school_id AND eg.deleted_at IS NULL`;
 
-// ═══════════════════════════════════════════════════════════════
-// POST /api/results/compute/:examGroupId
-// FIXED: Section-wise calculation & NULL constraint fix for DB
-// ═══════════════════════════════════════════════════════════════
-exports.computeResults = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { examGroupId } = req.params;
-    const { section_id } = req.body; // 🔴 Bring back section_id from Frontend
+// ═══════════════════════════ EXAM LIST (results screen) ═══════════════════════════
+exports.listExamGroups = handle(async (req, res) => {
+  const { schoolId } = req.user;
+  const { academic_year_id } = req.query;
+  if (academic_year_id) R.needUuid(academic_year_id, 'academic_year_id');
+  const r = await query(`
+    SELECT eg.id, eg.name, eg.exam_type, eg.start_date, eg.end_date, eg.weightage_percent, eg.status, eg.academic_year_id,
+           (SELECT COUNT(*) FROM exam_results er WHERE er.exam_group_id = eg.id) AS results_computed_count
+    FROM exam_groups eg
+    WHERE eg.school_id=@sid AND eg.deleted_at IS NULL AND (@ayId IS NULL OR eg.academic_year_id=@ayId)
+    ORDER BY eg.start_date DESC`, { sid: U(schoolId), ayId: U(academic_year_id || null) });
+  return success(res, r.recordset, 'Exam groups fetched');
+});
 
-    if (!section_id) return badRequest(res, 'section_id is required in body');
+// ═══════════════════════════ COMPUTE ═══════════════════════════
+// Rules per student and subject (marks are handled in integer paise-style cents, never float sums):
+//   no marks row / present without marks      -> missing  => student is "incomplete"
+//   leave | tc | exempted                      -> ignored (not in max, not a fail)
+//   absent | malpractice                       -> max counts, scores 0, student fails
+//   present                                    -> marks counted, below passing marks => fail
+//   grade-only subjects never add marks/max (they only need a grade, absent => fail)
+async function computeSection(schoolId, exam, sectionId) {
+  const p = { eid: U(exam.id), sec: U(sectionId), sid: U(schoolId), ay: U(exam.academic_year_id) };
+  const [subs, scaleR, stuR, marksR] = await Promise.all([
+    query(`SELECT id, max_marks, passing_marks, is_grade_only FROM exam_subjects WHERE exam_group_id=@eid AND section_id=@sec AND school_id=@sid AND deleted_at IS NULL`, p),
+    query(`SELECT grade_label, min_percent FROM grading_scale WHERE school_id=@sid ORDER BY min_percent DESC`, p),
+    query(`SELECT DISTINCT student_id FROM enrolments WHERE section_id=@sec AND school_id=@sid AND academic_year_id=@ay AND is_active=1 AND deleted_at IS NULL`, p),
+    query(`SELECT em.exam_subject_id, em.student_id, em.marks_obtained, em.grade_obtained, em.status
+           FROM exam_marks em JOIN exam_subjects es ON es.id = em.exam_subject_id
+           WHERE es.exam_group_id=@eid AND es.section_id=@sec AND es.school_id=@sid AND es.deleted_at IS NULL`, p),
+  ]);
+  const subjects = subs.recordset, scale = scaleR.recordset, students = stuR.recordset.map((x) => String(x.student_id).toLowerCase());
+  if (!subjects.length) throw bad('No subjects in the date sheet for this class - add them first');
+  if (!scale.length) throw bad('Set up the grading scale first (Setup > Grading Scale)');
 
-    const examGroup = await queryOne(
-      `SELECT id, academic_year_id FROM exam_groups WHERE id=@id AND school_id=@sid AND deleted_at IS NULL`,
-      { id: { type: sql.UniqueIdentifier, value: examGroupId }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
-    if (!examGroup) return notFound(res, 'Exam group not found');
+  const markIdx = new Map();
+  marksR.recordset.forEach((m) => markIdx.set(`${String(m.student_id).toLowerCase()}|${String(m.exam_subject_id).toLowerCase()}`, m));
 
-    // Fetch subjects ONLY for this specific section
-    const esRows = await query(
-      `SELECT id AS exam_subject_id, section_id, subject_id, max_marks, passing_marks, is_grade_only
-       FROM exam_subjects WHERE exam_group_id=@egId AND section_id=@secId AND school_id=@sid AND deleted_at IS NULL`,
-      { 
-        egId: { type: sql.UniqueIdentifier, value: examGroupId }, 
-        secId: { type: sql.UniqueIdentifier, value: section_id }, 
-        sid: { type: sql.UniqueIdentifier, value: schoolId } 
-      }
-    );
-    const examSubjects = esRows.recordset;
-    if (!examSubjects.length) return badRequest(res, 'No subjects configured for this class/section');
-
-    const gsRows = await query(
-      `SELECT grade_label, min_percent, max_percent FROM grading_scale WHERE school_id=@sid ORDER BY sort_order`,
-      { sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
-    const gradingScale = gsRows.recordset;
-    const resolveGrade = (pct) => {
-      const row = gradingScale.find((g) => pct >= g.min_percent && pct <= g.max_percent);
-      return row ? row.grade_label : null;
-    };
-
-    const allExamSubjectIds = examSubjects.map((es) => es.exam_subject_id);
-    const idParams = {};
-    const idNames = allExamSubjectIds.map((id, i) => {
-      idParams[`es${i}`] = { type: sql.UniqueIdentifier, value: id };
-      return `@es${i}`;
-    });
-    
-    const marksRows = await query(
-      `SELECT exam_subject_id, student_id, marks_obtained, grade_obtained, status
-       FROM exam_marks WHERE exam_subject_id IN (${idNames.join(',')})`,
-      idParams
-    );
-    const marksByStudentSubject = {};
-    marksRows.recordset.forEach((m) => {
-      if (!marksByStudentSubject[m.student_id]) marksByStudentSubject[m.student_id] = {};
-      marksByStudentSubject[m.student_id][m.exam_subject_id] = m;
-    });
-
-    const computedRows = [];
-    
-    // MaxTotal exclusively from Scholastic subjects
-    const maxTotal = examSubjects
-      .filter(s => !s.is_grade_only)
-      .reduce((s, x) => s + Number(x.max_marks), 0);
-
-    const enrolRows = await query(
-      `SELECT student_id FROM enrolments
-       WHERE section_id=@secId AND school_id=@sid AND academic_year_id=@ayId AND is_active=1 AND deleted_at IS NULL`,
-      {
-        secId: { type: sql.UniqueIdentifier, value: section_id },
-        sid: { type: sql.UniqueIdentifier, value: schoolId },
-        ayId: { type: sql.UniqueIdentifier, value: examGroup.academic_year_id },
-      }
-    );
-
-    for (const { student_id } of enrolRows.recordset) {
-      const studentMarks = marksByStudentSubject[student_id] || {};
-      let enteredCount = 0;
-      let totalMarks = 0;
-      let anyFail = false;
-
-      for (const es of examSubjects) {
-        const row = studentMarks[es.exam_subject_id];
-        
-        if (!row) continue;
-        if (row.status === 'present') {
-            if (es.is_grade_only && !row.grade_obtained) continue; 
-            if (!es.is_grade_only && (row.marks_obtained === null || row.marks_obtained === undefined)) continue;
-        }
-        
-        enteredCount++;
-
-        if (es.is_grade_only) {
-          if (row.status === 'absent') anyFail = true;
-        } else {
-          const obtained = Number(row.marks_obtained);
-          totalMarks += obtained;
-          if (row.status === 'absent' || obtained < Number(es.passing_marks)) {
-            anyFail = true;
-          }
-        }
-      }
-
-      // Incomplete Result Logic
-      if (enteredCount < examSubjects.length) {
-        computedRows.push({
-          student_id, section_id,
-          total_marks: totalMarks, // 🔴 Bug Fix: Assign current total instead of NULL
-          max_total: maxTotal, 
-          percentage: 0,           // 🔴 Bug Fix: 0 instead of NULL
-          grade: null, status: 'incomplete',
-        });
+  const rows = students.map((sid) => {
+    let obtained = 0, maxC = 0, missing = 0, anyFail = false;
+    for (const es of subjects) {
+      const m = markIdx.get(`${sid}|${String(es.id).toLowerCase()}`);
+      if (!m) { missing++; continue; }
+      const st = m.status || 'present';
+      if (R.EXEMPT.has(st)) continue;
+      if (es.is_grade_only) {
+        if (R.FAILING.has(st)) anyFail = true;
+        else if (!m.grade_obtained) missing++;
         continue;
       }
-
-      const percentage = maxTotal > 0 ? (totalMarks / maxTotal) * 100 : 0;
-      computedRows.push({
-        student_id, section_id,
-        total_marks: totalMarks, max_total: maxTotal,
-        percentage: Math.round(percentage * 100) / 100,
-        grade: resolveGrade(percentage),
-        status: anyFail ? 'fail' : 'pass',
-      });
+      maxC += R.cents(es.max_marks);
+      if (R.FAILING.has(st)) { anyFail = true; continue; }
+      if (m.marks_obtained === null || m.marks_obtained === undefined) { missing++; continue; }
+      obtained += R.cents(m.marks_obtained);
+      if (Number(m.marks_obtained) < Number(es.passing_marks)) anyFail = true;
     }
+    const complete = missing === 0 && maxC > 0;
+    const percentage = complete ? R.round2((obtained / maxC) * 100) : 0;
+    return {
+      student_id: sid, total_marks: obtained / 100, max_total: maxC / 100, pct: percentage,
+      grade: complete ? R.gradeFor(scale, percentage) : null,
+      status: !complete ? 'incomplete' : anyFail ? 'fail' : 'pass',
+    };
+  });
 
-    // Ranking Logic (Only for complete results)
-    const ranked = computedRows.filter((r) => r.status !== 'incomplete');
-    ranked.sort((a, b) => b.percentage - a.percentage);
-    let rank = 0, prevPct = null;
-    ranked.forEach((r, idx) => {
-      if (r.percentage !== prevPct) rank = idx + 1;
-      r.class_rank = rank;
-      prevPct = r.percentage;
-    });
+  const j = JSON.stringify(rows), ids = JSON.stringify(students);
+  await withTransaction(async (tx) => {
+    const rq = (text) => {
+      const r = tx.request();
+      r.input('eid', sql.UniqueIdentifier, exam.id); r.input('sec', sql.UniqueIdentifier, sectionId); r.input('sid', sql.UniqueIdentifier, schoolId);
+      r.input('j', sql.NVarChar(sql.MAX), j); r.input('ids', sql.NVarChar(sql.MAX), ids);
+      return r.query(text);
+    };
+    // also clears a stale row left in another section if a student was moved
+    await rq(`DELETE FROM exam_results WHERE exam_group_id=@eid AND school_id=@sid
+                AND (section_id=@sec OR student_id IN (SELECT CAST(value AS uniqueidentifier) FROM OPENJSON(@ids)))`);
+    if (rows.length) {
+      await rq(`INSERT INTO exam_results (id, exam_group_id, section_id, student_id, school_id, total_marks, max_total, percentage, grade, status, computed_at)
+                SELECT NEWID(), @eid, @sec, student_id, @sid, total_marks, max_total, pct, grade, status, GETUTCDATE()
+                FROM OPENJSON(@j) WITH (student_id uniqueidentifier '$.student_id', total_marks decimal(8,2) '$.total_marks', max_total decimal(8,2) '$.max_total',
+                                        pct decimal(5,2) '$.pct', grade varchar(10) '$.grade', status varchar(20) '$.status')`);
+    }
+    // ranks: class_rank = within the section, school_rank = within the whole class (all sections of the grade). incomplete = no rank.
+    await rq(`UPDATE er SET class_rank = x.rk
+              FROM exam_results er JOIN (SELECT id, RANK() OVER (PARTITION BY section_id ORDER BY percentage DESC) AS rk
+                                         FROM exam_results WHERE exam_group_id=@eid AND school_id=@sid AND status<>'incomplete') x ON x.id = er.id
+              WHERE er.exam_group_id=@eid AND er.section_id=@sec`);
+    await rq(`UPDATE er SET school_rank = x.rk
+              FROM exam_results er JOIN (SELECT r.id, RANK() OVER (PARTITION BY sc.grade_id ORDER BY r.percentage DESC) AS rk
+                                         FROM exam_results r JOIN sections sc ON sc.id = r.section_id
+                                         WHERE r.exam_group_id=@eid AND r.school_id=@sid AND r.status<>'incomplete') x ON x.id = er.id
+              WHERE er.exam_group_id=@eid AND er.school_id=@sid`);
+    await rq(`UPDATE exam_results SET class_rank=NULL, school_rank=NULL WHERE exam_group_id=@eid AND school_id=@sid AND status='incomplete'`);
+  });
+  return { section_id: sectionId, computed: rows.length, incomplete: rows.filter((r) => r.status === 'incomplete').length, passed: rows.filter((r) => r.status === 'pass').length, failed: rows.filter((r) => r.status === 'fail').length };
+}
 
-    await withTransaction(async (tx) => {
-      // 🔴 Delete only for THIS specific section, not the whole exam
-      const rDel = tx.request();
-      rDel.input('egId', sql.UniqueIdentifier, examGroupId);
-      rDel.input('secId', sql.UniqueIdentifier, section_id);
-      rDel.input('sid', sql.UniqueIdentifier, schoolId);
-      await rDel.query(`DELETE FROM exam_results WHERE exam_group_id=@egId AND section_id=@secId AND school_id=@sid`);
+// POST /api/results/compute/:examGroupId   Body: { section_id? }  (no section_id = every class of the exam)
+exports.computeResults = handle(async (req, res) => {
+  const { schoolId } = req.user;
+  const exam = await R.loadExam(schoolId, req.params.examGroupId);
+  R.assertEditable(exam);
+  const { section_id } = req.body || {};
+  let sectionIds;
+  if (section_id && section_id !== 'all') {
+    R.needUuid(section_id, 'section_id');
+    const ok = await query(`SELECT 1 AS ok FROM exam_sections WHERE exam_group_id=@eid AND section_id=@sec AND school_id=@sid`, { eid: U(exam.id), sec: U(section_id), sid: U(schoolId) });
+    if (!ok.recordset.length) throw bad('This class/section is not part of the exam');
+    sectionIds = [section_id];
+  } else {
+    const r = await query(`SELECT section_id FROM exam_sections WHERE exam_group_id=@eid AND school_id=@sid AND EXISTS
+                           (SELECT 1 FROM exam_subjects x WHERE x.exam_group_id=@eid AND x.section_id=exam_sections.section_id AND x.deleted_at IS NULL)`, { eid: U(exam.id), sid: U(schoolId) });
+    sectionIds = r.recordset.map((x) => x.section_id);
+    if (!sectionIds.length) throw bad('No class has a date sheet yet');
+  }
+  const sections = [];
+  for (const id of sectionIds) sections.push(await computeSection(schoolId, exam, id));
+  const sum = (k) => sections.reduce((n, s) => n + s[k], 0);
+  const out = { total_students: sum('computed'), computed: sum('computed'), incomplete: sum('incomplete'), passed: sum('passed'), failed: sum('failed'), sections };
+  return success(res, out, `Results computed for ${out.computed} student(s)${out.incomplete ? ` (${out.incomplete} incomplete)` : ''}`);
+});
 
-      for (const r of computedRows) {
-        const req2 = tx.request();
-        req2.input('sid', sql.UniqueIdentifier, schoolId);
-        req2.input('egId', sql.UniqueIdentifier, examGroupId);
-        req2.input('secId', sql.UniqueIdentifier, r.section_id);
-        req2.input('stuId', sql.UniqueIdentifier, r.student_id);
-        // 🔴 NULL FIX: Using fallback || 0 for DB constraints
-        req2.input('total', sql.Decimal(10, 2), r.total_marks || 0);
-        req2.input('maxTotal', sql.Decimal(10, 2), r.max_total || 0);
-        req2.input('pct', sql.Decimal(5, 2), r.percentage || 0);
-        req2.input('grade', sql.VarChar(10), r.grade || null);
-        req2.input('crank', sql.Int, r.class_rank || null);
-        req2.input('status', sql.VarChar(20), r.status);
-        await req2.query(
-          `INSERT INTO exam_results
-             (id, exam_group_id, section_id, student_id, school_id, total_marks, max_total, percentage, grade, class_rank, status, computed_at)
-           VALUES
-             (NEWID(), @egId, @secId, @stuId, @sid, @total, @maxTotal, @pct, @grade, @crank, @status, GETUTCDATE())`
-        );
-      }
-    });
+// ═══════════════════════════ ANALYTICS ═══════════════════════════
+// one definition everywhere: pass % = pass / (pass + fail); averages ignore incomplete rows.
+const AVG = `AVG(CASE WHEN er.status <> 'incomplete' THEN er.percentage END)`;
+const PASS = `SUM(CASE WHEN er.status='pass' THEN 1 ELSE 0 END)`;
+const FAIL = `SUM(CASE WHEN er.status='fail' THEN 1 ELSE 0 END)`;
 
-    return success(res, {
-      total_students: computedRows.length,
-      computed: ranked.length,
-      incomplete: computedRows.length - ranked.length,
-    }, 'Results computed successfully');
-  } catch (err) { next(err); }
-};
+exports.getOverview = handle(async (req, res) => {
+  const { schoolId } = req.user;
+  const egId = needExamParam(req);
+  const p = { egId: U(egId), sid: U(schoolId) };
+  const [stats, topper] = await Promise.all([
+    query(`SELECT COUNT(*) AS total_appeared, ${PASS} AS total_pass, ${FAIL} AS total_fail,
+                  SUM(CASE WHEN er.status='incomplete' THEN 1 ELSE 0 END) AS total_incomplete,
+                  ${AVG} AS avg_percentage, MAX(CASE WHEN er.status <> 'incomplete' THEN er.percentage END) AS highest_percentage
+           FROM exam_results er ${EXAM_JOIN} WHERE er.exam_group_id=@egId AND er.school_id=@sid`, p),
+    query(`SELECT TOP 1 er.student_id, (s.first_name + ' ' + ISNULL(s.last_name,'')) AS full_name, er.percentage, g.name AS grade_name, sec.name AS section_name
+           FROM exam_results er ${EXAM_JOIN}
+           JOIN students s ON s.id = er.student_id JOIN sections sec ON sec.id = er.section_id JOIN grades g ON g.id = sec.grade_id
+           WHERE er.exam_group_id=@egId AND er.school_id=@sid AND er.status='pass'
+           ORDER BY er.percentage DESC, er.total_marks DESC`, p),
+  ]);
+  const s = stats.recordset[0];
+  return success(res, {
+    total_appeared: s.total_appeared || 0, total_pass: s.total_pass || 0, total_fail: s.total_fail || 0, total_incomplete: s.total_incomplete || 0,
+    pass_percent: ratio(s.total_pass || 0, (s.total_pass || 0) + (s.total_fail || 0)),
+    avg_percentage: pct2(s.avg_percentage), highest_percentage: s.highest_percentage,
+    topper: topper.recordset[0] || null,
+  }, 'Overview fetched');
+});
 
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/overview?exam_group_id=
-// ═══════════════════════════════════════════════════════════════
-exports.getOverview = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { exam_group_id } = req.query;
-    if (!exam_group_id) return badRequest(res, 'exam_group_id is required');
+exports.getClassWise = handle(async (req, res) => {
+  const egId = needExamParam(req);
+  const r = await query(`
+    SELECT g.id AS grade_id, g.name AS grade_name, COUNT(*) AS total_students, ${PASS} AS pass_count, ${FAIL} AS fail_count, ${AVG} AS avg_percentage
+    FROM exam_results er ${EXAM_JOIN} JOIN sections sec ON sec.id = er.section_id JOIN grades g ON g.id = sec.grade_id
+    WHERE er.exam_group_id=@egId AND er.school_id=@sid
+    GROUP BY g.id, g.name, g.numeric_order ORDER BY g.numeric_order`, { egId: U(egId), sid: U(req.user.schoolId) });
+  return success(res, r.recordset.map((x) => ({ ...x, avg_percentage: pct2(x.avg_percentage), pass_percent: ratio(x.pass_count, x.pass_count + x.fail_count) })), 'Class-wise analysis fetched');
+});
 
-    const stats = await queryOne(
-      `SELECT
-         COUNT(*) AS total_appeared,
-         SUM(CASE WHEN status='pass' THEN 1 ELSE 0 END) AS total_pass,
-         SUM(CASE WHEN status='fail' THEN 1 ELSE 0 END) AS total_fail,
-         SUM(CASE WHEN status='incomplete' THEN 1 ELSE 0 END) AS total_incomplete,
-         AVG(CASE WHEN percentage IS NOT NULL THEN percentage END) AS avg_percentage,
-         MAX(percentage) AS highest_percentage
-       FROM exam_results WHERE exam_group_id=@egId AND school_id=@sid`,
-      { egId: { type: sql.UniqueIdentifier, value: exam_group_id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
+exports.getSectionWise = handle(async (req, res) => {
+  const egId = needExamParam(req);
+  const r = await query(`
+    SELECT sec.id AS section_id, sec.name AS section_name, g.name AS grade_name, COUNT(*) AS total_students, ${PASS} AS pass_count, ${FAIL} AS fail_count, ${AVG} AS avg_percentage
+    FROM exam_results er ${EXAM_JOIN} JOIN sections sec ON sec.id = er.section_id JOIN grades g ON g.id = sec.grade_id
+    WHERE er.exam_group_id=@egId AND er.school_id=@sid
+    GROUP BY sec.id, sec.name, g.name, g.numeric_order ORDER BY g.numeric_order, sec.name`, { egId: U(egId), sid: U(req.user.schoolId) });
+  return success(res, r.recordset.map((x) => ({ ...x, avg_percentage: pct2(x.avg_percentage), pass_percent: ratio(x.pass_count, x.pass_count + x.fail_count) })), 'Section-wise analysis fetched');
+});
 
-    const topper = await queryOne(
-      `SELECT TOP 1 er.student_id, (s.first_name + ' ' + ISNULL(s.last_name,'')) AS full_name,
-              er.percentage, g.name AS grade_name, sec.name AS section_name
-       FROM exam_results er
-       JOIN students s ON s.id = er.student_id
-       JOIN sections sec ON sec.id = er.section_id
-       JOIN grades g ON g.id = sec.grade_id
-       WHERE er.exam_group_id=@egId AND er.school_id=@sid AND er.status='pass'
-       ORDER BY er.percentage DESC`,
-      { egId: { type: sql.UniqueIdentifier, value: exam_group_id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
+exports.getSectionResults = handle(async (req, res) => {
+  const { schoolId } = req.user;
+  const egId = needExamParam(req);
+  const { section_id } = req.query;
+  if (!section_id) throw bad('exam_group_id and section_id are required');
+  R.needUuid(section_id, 'section_id');
+  const r = await query(`
+    SELECT er.student_id, (s.first_name + ' ' + ISNULL(s.last_name,'')) AS student_name, enr.roll_no,
+           er.total_marks, er.max_total, er.percentage, er.grade, er.class_rank, er.school_rank, er.status
+    FROM exam_results er ${EXAM_JOIN}
+    JOIN students s ON s.id = er.student_id
+    LEFT JOIN enrolments enr ON enr.student_id=er.student_id AND enr.section_id=er.section_id AND enr.academic_year_id=eg.academic_year_id AND enr.is_active=1 AND enr.deleted_at IS NULL
+    WHERE er.exam_group_id=@egId AND er.section_id=@secId AND er.school_id=@sid
+    ORDER BY ISNULL(er.class_rank, 999999), TRY_CAST(enr.roll_no AS INT)`, { egId: U(egId), secId: U(section_id), sid: U(schoolId) });
+  return success(res, r.recordset, 'Section results fetched');
+});
 
-    const denom = (stats.total_appeared || 0) - (stats.total_incomplete || 0);
-    return success(res, {
-      total_appeared: stats.total_appeared || 0,
-      total_pass: stats.total_pass || 0,
-      total_fail: stats.total_fail || 0,
-      total_incomplete: stats.total_incomplete || 0,
-      pass_percent: denom > 0 ? Math.round((stats.total_pass / denom) * 10000) / 100 : 0,
-      avg_percentage: stats.avg_percentage ? Math.round(stats.avg_percentage * 100) / 100 : 0,
-      highest_percentage: stats.highest_percentage,
-      topper,
-    }, 'Overview fetched');
-  } catch (err) { next(err); }
-};
+// subject-wise: only students who actually sat the paper count (present); absent/malpractice shown separately; exempt ignored
+const SUBJ_FROM = `
+  FROM exam_subjects es
+  JOIN exam_groups eg ON eg.id = es.exam_group_id AND eg.school_id = es.school_id AND eg.deleted_at IS NULL
+  JOIN subjects s ON s.id = es.subject_id
+  JOIN exam_marks em ON em.exam_subject_id = es.id AND em.status NOT IN ('leave','tc','exempted')
+  WHERE es.exam_group_id=@egId AND es.school_id=@sid AND es.deleted_at IS NULL AND es.is_grade_only = 0`;
+const SUBJ_AGG = `
+  COUNT(em.id) AS total_attempted,
+  SUM(CASE WHEN em.status IN ('absent','malpractice') THEN 1 ELSE 0 END) AS absent_count,
+  SUM(CASE WHEN em.status='present' THEN 1 ELSE 0 END) AS present_count,
+  SUM(CASE WHEN em.status='present' AND em.marks_obtained >= es.passing_marks THEN 1 ELSE 0 END) AS pass_count,
+  AVG(CASE WHEN em.status='present' AND em.marks_obtained IS NOT NULL THEN (em.marks_obtained / NULLIF(es.max_marks,0)) * 100 END) AS avg_percentage`;
 
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/class-wise?exam_group_id=
-// ═══════════════════════════════════════════════════════════════
-exports.getClassWise = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { exam_group_id } = req.query;
-    if (!exam_group_id) return badRequest(res, 'exam_group_id is required');
+exports.getSubjectWise = handle(async (req, res) => {
+  const egId = needExamParam(req);
+  const r = await query(`
+    SELECT s.id AS subject_id, s.name AS subject_name, ${SUBJ_AGG},
+           MAX(CASE WHEN em.status='present' THEN em.marks_obtained END) AS highest_marks,
+           MIN(CASE WHEN em.status='present' THEN em.marks_obtained END) AS lowest_marks,
+           MAX(CASE WHEN em.status='present' THEN (em.marks_obtained / NULLIF(es.max_marks,0)) * 100 END) AS highest_percent,
+           MIN(CASE WHEN em.status='present' THEN (em.marks_obtained / NULLIF(es.max_marks,0)) * 100 END) AS lowest_percent
+    ${SUBJ_FROM}
+    GROUP BY s.id, s.name ORDER BY s.name`, { egId: U(egId), sid: U(req.user.schoolId) });
+  return success(res, r.recordset.map((x) => ({
+    ...x, avg_percentage: pct2(x.avg_percentage), highest_percent: pct2(x.highest_percent), lowest_percent: pct2(x.lowest_percent),
+    pass_percent: ratio(x.pass_count, x.present_count),
+  })), 'Subject-wise analysis fetched');
+});
 
-    const result = await query(
-      `SELECT g.id AS grade_id, g.name AS grade_name,
-              COUNT(er.id) AS total_students,
-              SUM(CASE WHEN er.status='pass' THEN 1 ELSE 0 END) AS pass_count,
-              AVG(CASE WHEN er.percentage IS NOT NULL THEN er.percentage END) AS avg_percentage
-       FROM exam_results er
-       JOIN sections sec ON sec.id = er.section_id
-       JOIN grades g ON g.id = sec.grade_id
-       WHERE er.exam_group_id=@egId AND er.school_id=@sid
-       GROUP BY g.id, g.name, g.numeric_order
-       ORDER BY g.numeric_order`,
-      { egId: { type: sql.UniqueIdentifier, value: exam_group_id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
-    const rows = result.recordset.map((r) => ({
-      ...r,
-      avg_percentage: r.avg_percentage ? Math.round(r.avg_percentage * 100) / 100 : 0,
-      pass_percent: r.total_students ? Math.round((r.pass_count / r.total_students) * 10000) / 100 : 0,
-    }));
-    return success(res, rows, 'Class-wise analysis fetched');
-  } catch (err) { next(err); }
-};
+exports.getTeacherWise = handle(async (req, res) => {
+  const egId = needExamParam(req);
+  const r = await query(`
+    SELECT u.id AS teacher_user_id, ISNULL(u.full_name, 'Unassigned') AS teacher_name, s.name AS subject_name,
+           g.name AS grade_name, sec.name AS section_name, es.is_grade_only, ${SUBJ_AGG}
+    FROM exam_subjects es
+    JOIN exam_groups eg ON eg.id = es.exam_group_id AND eg.school_id = es.school_id AND eg.deleted_at IS NULL
+    JOIN subjects s ON s.id = es.subject_id
+    JOIN sections sec ON sec.id = es.section_id JOIN grades g ON g.id = sec.grade_id
+    JOIN exam_marks em ON em.exam_subject_id = es.id AND em.status NOT IN ('leave','tc','exempted')
+    OUTER APPLY (SELECT TOP 1 te.teacher_id FROM timetable_entries te
+                 WHERE te.section_id = es.section_id AND te.subject_id = es.subject_id AND te.school_id = es.school_id
+                 GROUP BY te.teacher_id ORDER BY COUNT(*) DESC) assigned
+    LEFT JOIN users u ON u.id = assigned.teacher_id
+    WHERE es.exam_group_id=@egId AND es.school_id=@sid AND es.deleted_at IS NULL AND es.is_grade_only = 0
+    GROUP BY u.id, u.full_name, s.name, g.name, sec.name, es.is_grade_only
+    ORDER BY ISNULL(u.full_name, 'zzz'), g.name, sec.name`, { egId: U(egId), sid: U(req.user.schoolId) });
+  return success(res, r.recordset.map((x) => ({ ...x, avg_percentage: pct2(x.avg_percentage), pass_percent: ratio(x.pass_count, x.present_count) })), 'Teacher-wise analysis fetched');
+});
 
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/section-wise?exam_group_id=&grade_id=
-// ═══════════════════════════════════════════════════════════════
-exports.getSectionWise = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { exam_group_id, grade_id } = req.query;
-    if (!exam_group_id) return badRequest(res, 'exam_group_id is required');
+exports.getToppers = handle(async (req, res) => {
+  const egId = needExamParam(req);
+  const { grade_id, limit } = req.query;
+  if (grade_id) R.needUuid(grade_id, 'grade_id');
+  const top = Math.min(Math.max(Number(limit) || 10, 1), 50);
+  const r = await query(`
+    SELECT TOP (@top) er.student_id, (s.first_name + ' ' + ISNULL(s.last_name,'')) AS student_name, er.percentage, er.grade, er.class_rank, er.school_rank,
+           g.name AS grade_name, sec.name AS section_name, enr.roll_no
+    FROM exam_results er ${EXAM_JOIN}
+    JOIN students s ON s.id = er.student_id JOIN sections sec ON sec.id = er.section_id JOIN grades g ON g.id = sec.grade_id
+    LEFT JOIN enrolments enr ON enr.student_id = er.student_id AND enr.section_id = er.section_id AND enr.academic_year_id = eg.academic_year_id AND enr.is_active=1 AND enr.deleted_at IS NULL
+    WHERE er.exam_group_id=@egId AND er.school_id=@sid AND er.status='pass' AND (@gradeId IS NULL OR g.id=@gradeId)
+    ORDER BY er.percentage DESC, er.total_marks DESC`,
+    { top: { type: sql.Int, value: top }, gradeId: U(grade_id || null), egId: U(egId), sid: U(req.user.schoolId) });
+  return success(res, r.recordset, 'Toppers fetched');
+});
 
-    const result = await query(
-      `SELECT sec.id AS section_id, sec.name AS section_name, g.name AS grade_name,
-              COUNT(er.id) AS total_students,
-              SUM(CASE WHEN er.status='pass' THEN 1 ELSE 0 END) AS pass_count,
-              AVG(CASE WHEN er.percentage IS NOT NULL THEN er.percentage END) AS avg_percentage
-       FROM exam_results er
-       JOIN sections sec ON sec.id = er.section_id
-       JOIN grades g ON g.id = sec.grade_id
-       WHERE er.exam_group_id=@egId AND er.school_id=@sid
-         AND (@gradeId IS NULL OR g.id=@gradeId)
-       GROUP BY sec.id, sec.name, g.name
-       ORDER BY g.name, sec.name`,
-      {
-        egId: { type: sql.UniqueIdentifier, value: exam_group_id },
-        sid: { type: sql.UniqueIdentifier, value: schoolId },
-        gradeId: { type: sql.UniqueIdentifier, value: grade_id || null },
-      }
-    );
-    const rows = result.recordset.map((r) => ({
-      ...r,
-      avg_percentage: r.avg_percentage ? Math.round(r.avg_percentage * 100) / 100 : 0,
-      pass_percent: r.total_students ? Math.round((r.pass_count / r.total_students) * 10000) / 100 : 0,
-    }));
-    return success(res, rows, 'Section-wise analysis fetched');
-  } catch (err) { next(err); }
-};
+// ═══════════════════════════ STUDENT VIEWS ═══════════════════════════
+// students (req.student) only ever see published exams; staff see everything.
+exports.getStudentTrend = handle(async (req, res) => {
+  const { schoolId } = req.user;
+  R.needUuid(req.params.studentId, 'student id');
+  const r = await query(`
+    SELECT eg.id AS exam_group_id, eg.name AS exam_name, eg.exam_type, eg.start_date, er.percentage, er.grade, er.class_rank, er.school_rank, er.status
+    FROM exam_results er ${EXAM_JOIN}
+    WHERE er.student_id=@stuId AND er.school_id=@sid AND (@onlyPub = 0 OR eg.status='published')
+    ORDER BY eg.start_date ASC`, { stuId: U(req.params.studentId), sid: U(schoolId), onlyPub: { type: sql.Bit, value: isStudent(req) ? 1 : 0 } });
+  return success(res, r.recordset, 'Student exam trend fetched');
+});
 
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/section-results?exam_group_id=&section_id=
-// Drilldown: every student in a section, with their result
-// ═══════════════════════════════════════════════════════════════
-exports.getSectionResults = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { exam_group_id, section_id } = req.query;
-    if (!exam_group_id || !section_id) return badRequest(res, 'exam_group_id and section_id are required');
+exports.getStudentReportCard = handle(async (req, res) => {
+  const { schoolId } = req.user;
+  const { studentId } = req.params;
+  R.needUuid(studentId, 'student id');
+  const examId = needExamParam(req);
+  const exam = await examFor(req, examId);
+  const p = { egId: U(exam.id), stuId: U(studentId), sid: U(schoolId) };
+  const o = await query(`SELECT total_marks, max_total, percentage, grade, class_rank, school_rank, status FROM exam_results WHERE exam_group_id=@egId AND student_id=@stuId AND school_id=@sid`, p);
+  if (!o.recordset.length) throw notFound('Result not computed for this student yet');
+  const subs = await query(`
+    SELECT s.name AS subject_name, em.marks_obtained, em.grade_obtained, em.status, es.max_marks, es.passing_marks, es.is_grade_only
+    FROM exam_marks em JOIN exam_subjects es ON es.id = em.exam_subject_id JOIN subjects s ON s.id = es.subject_id
+    WHERE es.exam_group_id=@egId AND em.student_id=@stuId AND em.school_id=@sid AND es.deleted_at IS NULL
+    ORDER BY es.exam_date, es.start_time, s.name`, p);
+  return success(res, { ...o.recordset[0], exam_status: exam.status, subjects: subs.recordset }, 'Report card fetched');
+});
 
-    const result = await query(
-      `SELECT er.student_id, (s.first_name + ' ' + ISNULL(s.last_name,'')) AS student_name,
-              enr.roll_no, er.total_marks, er.max_total, er.percentage, er.grade,
-              er.class_rank, er.school_rank, er.status
-       FROM exam_results er
-       JOIN students s ON s.id = er.student_id
-       LEFT JOIN enrolments enr ON enr.student_id=er.student_id AND enr.section_id=er.section_id AND enr.is_active=1
-       WHERE er.exam_group_id=@egId AND er.section_id=@secId AND er.school_id=@sid
-       ORDER BY ISNULL(er.class_rank, 999999) ASC`,
-      { egId: { type: sql.UniqueIdentifier, value: exam_group_id }, secId: { type: sql.UniqueIdentifier, value: section_id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
-    return success(res, result.recordset, 'Section results fetched');
-  } catch (err) { next(err); }
-};
+// ═══════════════════════════ PDFs (rendered on demand, never stored) ═══════════════════════════
+exports.downloadReportCardPdf = handle(async (req, res) => {
+  const { schoolId } = req.user;
+  R.needUuid(req.params.studentId, 'student id');
+  const examId = needExamParam(req);
+  const { buffer, filename } = await reportCardPdf(schoolId, req.params.studentId, examId, { requirePublished: isStudent(req) });
+  return sendPdf(res, buffer, filename);
+});
 
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/subject-wise?exam_group_id=
-// ═══════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/subject-wise?exam_group_id=
-// ═══════════════════════════════════════════════════════════════
-exports.getSubjectWise = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { exam_group_id } = req.query;
-    if (!exam_group_id) return badRequest(res, 'exam_group_id is required');
-
-    const result = await query(
-      `SELECT s.id AS subject_id, s.name AS subject_name, es.is_grade_only,
-              COUNT(em.id) AS total_attempted,
-              SUM(CASE WHEN em.status='absent' THEN 1 ELSE 0 END) AS absent_count,
-              SUM(CASE WHEN em.status<>'absent' AND es.is_grade_only = 0 AND em.marks_obtained >= es.passing_marks THEN 1 ELSE 0 END) AS pass_count,
-              -- 🔴 FIX: Prevent Divide by Zero by filtering is_grade_only = 0
-              AVG(CASE WHEN em.status<>'absent' AND em.marks_obtained IS NOT NULL AND es.is_grade_only = 0
-                       THEN (em.marks_obtained / es.max_marks) * 100 END) AS avg_percentage,
-              MAX(CASE WHEN em.status<>'absent' AND es.is_grade_only = 0 THEN em.marks_obtained END) AS highest_marks,
-              MIN(CASE WHEN em.status<>'absent' AND es.is_grade_only = 0 THEN em.marks_obtained END) AS lowest_marks
-       FROM exam_subjects es
-       JOIN subjects s ON s.id = es.subject_id
-       LEFT JOIN exam_marks em ON em.exam_subject_id = es.id
-       WHERE es.exam_group_id=@egId AND es.school_id=@sid AND es.deleted_at IS NULL
-       GROUP BY s.id, s.name, es.is_grade_only
-       ORDER BY s.name`,
-      { egId: { type: sql.UniqueIdentifier, value: exam_group_id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
-    
-    const rows = result.recordset.map((r) => {
-      const attemptedPresent = (r.total_attempted || 0) - (r.absent_count || 0);
-      return {
-        ...r,
-        avg_percentage: r.avg_percentage ? Math.round(r.avg_percentage * 100) / 100 : 0,
-        pass_percent: (attemptedPresent > 0 && !r.is_grade_only) ? Math.round((r.pass_count / attemptedPresent) * 10000) / 100 : 0,
-      };
-    });
-    return success(res, rows, 'Subject-wise analysis fetched');
-  } catch (err) { next(err); }
-};
-
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/teacher-wise?exam_group_id=
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/teacher-wise?exam_group_id=
-// ═══════════════════════════════════════════════════════════════
-exports.getTeacherWise = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { exam_group_id } = req.query;
-    if (!exam_group_id) return badRequest(res, 'exam_group_id is required');
-
-    const result = await query(
-      `SELECT u.id AS teacher_user_id, u.full_name AS teacher_name, s.name AS subject_name,
-              g.name AS grade_name, sec.name AS section_name, es.is_grade_only,
-              COUNT(em.id) AS total_attempted,
-              SUM(CASE WHEN em.status<>'absent' AND es.is_grade_only = 0 AND em.marks_obtained >= es.passing_marks THEN 1 ELSE 0 END) AS pass_count,
-              -- 🔴 FIX: Prevent Divide by Zero
-              AVG(CASE WHEN em.status<>'absent' AND em.marks_obtained IS NOT NULL AND es.is_grade_only = 0
-                       THEN (em.marks_obtained / es.max_marks) * 100 END) AS avg_percentage
-       FROM exam_subjects es
-       JOIN subjects s ON s.id = es.subject_id
-       JOIN sections sec ON sec.id = es.section_id
-       JOIN grades g ON g.id = sec.grade_id
-       LEFT JOIN exam_marks em ON em.exam_subject_id = es.id
-       OUTER APPLY (
-         SELECT TOP 1 te.teacher_id FROM timetable_entries te
-         WHERE te.section_id = es.section_id AND te.subject_id = es.subject_id AND te.school_id = es.school_id
-         GROUP BY te.teacher_id ORDER BY COUNT(*) DESC
-       ) assigned
-       JOIN users u ON u.id = assigned.teacher_id
-       WHERE es.exam_group_id=@egId AND es.school_id=@sid AND es.deleted_at IS NULL
-       GROUP BY u.id, u.full_name, s.name, g.name, sec.name, es.is_grade_only
-       ORDER BY u.full_name`,
-      { egId: { type: sql.UniqueIdentifier, value: exam_group_id }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
-    const rows = result.recordset.map((r) => ({
-      ...r,
-      avg_percentage: r.avg_percentage ? Math.round(r.avg_percentage * 100) / 100 : 0,
-      pass_percent: (r.total_attempted && !r.is_grade_only) ? Math.round((r.pass_count / r.total_attempted) * 10000) / 100 : 0,
-    }));
-    return success(res, rows, 'Teacher-wise analysis fetched');
-  } catch (err) { next(err); }
-};
-
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/toppers?exam_group_id=&grade_id=&limit=
-// ═══════════════════════════════════════════════════════════════
-exports.getToppers = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { exam_group_id, grade_id, limit } = req.query;
-    if (!exam_group_id) return badRequest(res, 'exam_group_id is required');
-    const top = Math.min(Number(limit) || 10, 50);
-
-    const result = await query(
-      `SELECT TOP (@top) er.student_id, (s.first_name + ' ' + ISNULL(s.last_name,'')) AS student_name,
-              er.percentage, er.grade, er.class_rank, er.school_rank,
-              g.name AS grade_name, sec.name AS section_name, enr.roll_no
-       FROM exam_results er
-       JOIN students s ON s.id = er.student_id
-       JOIN sections sec ON sec.id = er.section_id
-       JOIN grades g ON g.id = sec.grade_id
-       LEFT JOIN enrolments enr ON enr.student_id = er.student_id AND enr.section_id = er.section_id AND enr.is_active=1
-       WHERE er.exam_group_id=@egId AND er.school_id=@sid AND er.status='pass'
-         AND (@gradeId IS NULL OR g.id=@gradeId)
-       ORDER BY er.percentage DESC`,
-      {
-        top: { type: sql.Int, value: top },
-        egId: { type: sql.UniqueIdentifier, value: exam_group_id },
-        sid: { type: sql.UniqueIdentifier, value: schoolId },
-        gradeId: { type: sql.UniqueIdentifier, value: grade_id || null },
-      }
-    );
-    return success(res, result.recordset, 'Toppers fetched');
-  } catch (err) { next(err); }
-};
-
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/student/:studentId/trend
-// A student's percentage across ALL exam groups they've appeared
-// in — feeds the line-chart "previous exams comparison" view.
-// ═══════════════════════════════════════════════════════════════
-exports.getStudentTrend = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { studentId } = req.params;
-
-    const result = await query(
-      `SELECT eg.id AS exam_group_id, eg.name AS exam_name, eg.exam_type, eg.start_date,
-              er.percentage, er.grade, er.class_rank, er.school_rank, er.status
-       FROM exam_results er
-       JOIN exam_groups eg ON eg.id = er.exam_group_id
-       WHERE er.student_id=@stuId AND er.school_id=@sid
-       ORDER BY eg.start_date ASC`,
-      { stuId: { type: sql.UniqueIdentifier, value: studentId }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
-    return success(res, result.recordset, 'Student exam trend fetched');
-  } catch (err) { next(err); }
-};
-
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/student/:studentId/report-card?exam_group_id=
-// Full subject-wise marksheet for one student, one exam.
-// ═══════════════════════════════════════════════════════════════
-
-exports.getStudentReportCard = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { studentId } = req.params;
-    const { exam_group_id } = req.query;
-    if (!exam_group_id) return badRequest(res, 'exam_group_id is required');
-
-    const overall = await queryOne(
-      `SELECT total_marks, max_total, percentage, grade, class_rank, school_rank, status
-       FROM exam_results WHERE exam_group_id=@egId AND student_id=@stuId AND school_id=@sid`,
-      { egId: { type: sql.UniqueIdentifier, value: exam_group_id }, stuId: { type: sql.UniqueIdentifier, value: studentId }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
-    if (!overall) return notFound(res, 'Result not computed for this student yet');
-
-    // 🔴 UPDATE: Added is_grade_only and grade_obtained to this query
-    const subjects = await query(
-      `SELECT s.name AS subject_name, em.marks_obtained, em.grade_obtained, em.status, 
-              es.max_marks, es.passing_marks, es.is_grade_only
-       FROM exam_marks em
-       JOIN exam_subjects es ON es.id = em.exam_subject_id
-       JOIN subjects s ON s.id = es.subject_id
-       WHERE es.exam_group_id=@egId AND em.student_id=@stuId AND em.school_id=@sid
-       ORDER BY s.name`,
-      { egId: { type: sql.UniqueIdentifier, value: exam_group_id }, stuId: { type: sql.UniqueIdentifier, value: studentId }, sid: { type: sql.UniqueIdentifier, value: schoolId } }
-    );
-
-    return success(res, { ...overall, subjects: subjects.recordset }, 'Report card fetched');
-  } catch (err) { next(err); }
-};
-
-
-
-// ═══════════════════════════════════════════════════════════════
-// GET /api/results/student/:studentId/report-card/pdf?exam_group_id=
-// ═══════════════════════════════════════════════════════════════
-exports.downloadReportCardPdf = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { studentId } = req.params;
-    const { exam_group_id } = req.query;
-    if (!exam_group_id) return badRequest(res, 'exam_group_id is required');
-
-    const { buffer, filename } = await reportCardPdf(schoolId, studentId, exam_group_id);
-    return sendPdf(res, buffer, filename);
-  } catch (err) { next(err); }
-};
-
-
-
-exports.downloadBulkReportCards = async (req, res, next) => {
-  try {
-    const { schoolId } = req.user;
-    const { section_id, exam_group_id } = req.query;
-    if (!section_id || !exam_group_id) return badRequest(res, 'section_id and exam_group_id are required');
-
-    const { buffer, filename, count } = await bulkReportCardsPdf(schoolId, section_id, exam_group_id);
-    res.setHeader('X-Report-Count', String(count));
-    res.setHeader('Access-Control-Expose-Headers', 'X-Report-Count');
-    return sendPdf(res, buffer, filename);
-  } catch (err) { next(err); }
-};
+exports.downloadBulkReportCards = handle(async (req, res) => {
+  const { schoolId } = req.user;
+  const examId = needExamParam(req);
+  const { section_id } = req.query;
+  if (!section_id) throw bad('section_id and exam_group_id are required');
+  R.needUuid(section_id, 'section_id');
+  const { buffer, filename, count } = await bulkReportCardsPdf(schoolId, section_id, examId);
+  res.setHeader('X-Report-Count', String(count));
+  res.setHeader('Access-Control-Expose-Headers', 'X-Report-Count');
+  return sendPdf(res, buffer, filename);
+});

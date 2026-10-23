@@ -10,7 +10,7 @@ router.use(authenticate);
 router.get('/exam-groups',                ctrl.listExamGroups);        // ?academic_year_id=
 
 // ── Compute engine (admin/principal only) ────────────────────────────────
-router.post('/compute/:examGroupId',      authorize('school_admin', 'admin', 'principal'), ctrl.computeResults);
+router.post('/compute/:examGroupId',      authorize('school_admin'), ctrl.computeResults);
 
 // ── Analysis tabs ─────────────────────────────────────────────────────────
 router.get('/overview',                   ctrl.getOverview);           // ?exam_group_id=

@@ -94,6 +94,7 @@ exports.getSectionStudents = async (req, res, next) => {
          FROM exam_results x
          JOIN exam_groups eg ON eg.id = x.exam_group_id
          WHERE x.student_id = s.id AND eg.academic_year_id = e.academic_year_id
+           AND eg.deleted_at IS NULL AND eg.school_id = e.school_id AND x.status IN ('pass','fail')
          ORDER BY eg.end_date DESC
        ) er
        WHERE e.school_id=@sid AND e.section_id=@secId AND e.academic_year_id=@ay
