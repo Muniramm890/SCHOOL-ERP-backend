@@ -42,4 +42,9 @@ router.put('/gps/settings', ctrl.saveTraccarSettings);
 router.get('/gps/devices', ctrl.listGpsDevices);
 router.get('/gps/live', ctrl.getLivePositions);
 
+// Live fleet map (phone-fed + Traccar-fed positions) + Google Maps key
+const fleet = require('../controllers/fleetController');
+router.get('/fleet/live', fleet.fleetLive);
+router.get('/map-config', fleet.mapConfig);
+
 module.exports = router;

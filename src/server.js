@@ -137,6 +137,7 @@ app.use(`${API}/student/dashboard`,   require('./routes/student/Dashboard'));
 app.use(`${API}/student/inbox`,       require('./routes/student/Inbox'));
 app.use(`${API}/student/device-tokens`, require('./routes/student/DeviceTokens'));
 app.use(`${API}/student/quick-tests`, require('./routes/student/QuickTests'));
+app.use(`${API}/driver`,              require('./routes/driver'));        // bus phone: driver profile, tracker token, location posts
 app.use(`${API}/files`,               require('./routes/files').staff);   // PDF bytes for the in-app viewer (staff)
 app.use(`${API}/student/files`,       require('./routes/files').student); // PDF bytes for the in-app viewer (student)
 
