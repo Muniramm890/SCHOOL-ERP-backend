@@ -27,5 +27,12 @@ exports.fleetLive = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-// GET /api/transport/map-config — Google Maps JS key (public by design; restrict it by HTTP referrer in Google Cloud)
-exports.mapConfig = (req, res) => success(res, { google_maps_key: process.env.GOOGLE_MAPS_API_KEY || null });
+// GET /api/transport/map-config
+//  - default: free OpenStreetMap (no key, no billing)
+//  - optional MAP_TILE_URL / MAP_TILE_ATTRIBUTION: another tile provider, e.g. MapTiler/Stadia (https://.../{z}/{x}/{y}.png?key=...)
+//  - optional GOOGLE_MAPS_API_KEY: use Google Maps instead (key is public by design; restrict it by HTTP referrer)
+exports.mapConfig = (req, res) => success(res, {
+  google_maps_key: process.env.GOOGLE_MAPS_API_KEY || null,
+  tile_url: process.env.MAP_TILE_URL || null,
+  tile_attribution: process.env.MAP_TILE_ATTRIBUTION || null,
+});
