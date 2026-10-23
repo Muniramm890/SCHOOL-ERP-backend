@@ -1,90 +1,107 @@
 // src/services/documents/reportCard.js - premium report card (single + whole-section bulk), in-memory PDF
 const { query, queryOne, sql } = require('../../config/db');
 const K = require('./kit');
-const { W, M, CW, INK, MUTED, FAINT } = K;
+const { M, CW, INK, MUTED, FAINT, LINE } = K;
 const U = (v) => ({ type: sql.UniqueIdentifier, value: v });
 
-const gradeColor = (g) => {
-  if (['A+', 'A'].includes(g)) return '#16a34a';
-  if (['B+', 'B'].includes(g)) return '#2563eb';
-  if (g === 'C') return '#ca8a04';
-  return '#dc2626';
-};
 const pct = (m, max) => (max > 0 && m !== null && m !== undefined && m !== '' ? `${((Number(m) / Number(max)) * 100).toFixed(1)}%` : '-');
+const FAIL = '#b91c1c';
 
+// Official report card: full A4, single school theme, school text in header + footer
 function drawReportCardPage(doc, brand, { student, guardian, examName, overall, subjects, gradingScale, photo }) {
-  let y = K.drawHeader(doc, brand, { badge: 'Report Card', meta: [examName || 'Examination', `${student.class_name || ''}${student.section_name ? ' - ' + student.section_name : ''}`.trim()] });
+  const { width: W, height: H } = doc.page;
+  let y = K.drawHeader(doc, brand);
+  y = K.titleBand(doc, brand, y, 'Report Card', examName || 'Examination');
 
-  // ── student card ──
-  K.card(doc, M, y, CW, 76, { fill: brand.softer });
-  K.avatar(doc, brand, photo, student.student_name, M + 12, y + 7, 50, 62);
-  const gx = M + 76, gw = CW - 90, c3 = gw / 3;
-  K.kv(doc, 'Student Name', student.student_name, gx, y + 10, c3 * 2 - 10, { size: 10.5 });
-  K.kv(doc, 'Class & Section', `${student.class_name || '-'}${student.section_name ? ' (' + student.section_name + ')' : ''}`, gx + c3 * 2, y + 10, c3 - 6);
-  K.kv(doc, 'Roll No', student.roll_no || '-', gx, y + 42, c3 - 10);
-  K.kv(doc, 'Admission No', student.admission_no || '-', gx + c3, y + 42, c3 - 10);
-  K.kv(doc, 'Date of Birth', student.date_of_birth ? K.fmtDate(student.date_of_birth) : '-', gx + c3 * 2, y + 42, c3 - 6);
-  y += 76 + 6;
-  if (guardian) {
-    doc.font('Helvetica').fontSize(7.8).fillColor(MUTED).text(`Guardian: ${guardian.full_name}${guardian.relation ? ' (' + guardian.relation + ')' : ''}${guardian.phone ? '   -   ' + guardian.phone : ''}`, M + 2, y, { width: CW, lineBreak: false });
-    y += 12;
-  }
-  y += 6;
-
-  // ── performance tiles ──
-  const passed = overall.status === 'pass';
-  const tiles = [
-    ['Percentage', `${overall.percentage ?? '-'}%`, brand.deep],
-    ['Grade', overall.grade || '-', gradeColor(overall.grade)],
-    ['Total Marks', `${overall.total_marks ?? '-'} / ${overall.max_total ?? '-'}`, INK],
-    ['Rank', `#${overall.class_rank ?? '-'}  /  #${overall.school_rank ?? '-'}`, INK, 'Class / School'],
-  ];
-  const gap = 8, tw = (CW - gap * 4) / 5;
-  tiles.forEach(([label, value, color, sub], i) => {
-    const x = M + i * (tw + gap);
-    K.card(doc, x, y, tw, 50, { fill: '#ffffff' });
-    doc.font('Helvetica-Bold').fontSize(6.5).fillColor(FAINT).text(label.toUpperCase(), x, y + 9, { width: tw, align: 'center', characterSpacing: 0.7, lineBreak: false });
-    doc.font('Helvetica-Bold').fontSize(sub ? 12 : 15).fillColor(color).text(value, x, y + 21, { width: tw, align: 'center', lineBreak: false });
-    if (sub) doc.font('Helvetica').fontSize(6).fillColor(FAINT).text(sub, x, y + 38, { width: tw, align: 'center', lineBreak: false });
+  // ── student particulars (formal grid + photo) ──
+  const rowH = 23, gw = CW - 84;
+  const guardianText = guardian ? `${guardian.full_name}${guardian.relation ? ' (' + guardian.relation + ')' : ''}` : '-';
+  const gender = student.gender ? String(student.gender).charAt(0).toUpperCase() + String(student.gender).slice(1).toLowerCase() : '-';
+  const gy = K.infoGrid(doc, brand, {
+    x: M, y, w: gw, rowH,
+    rows: [
+      [['Student Name', student.student_name], ['Admission No', student.admission_no]],
+      [['Class & Section', `${student.class_name || '-'}${student.section_name ? ' (' + student.section_name + ')' : ''}`], ['Roll No', student.roll_no]],
+      [['Date of Birth', student.date_of_birth ? K.fmtDate(student.date_of_birth, true) : '-'], ['Gender', gender]],
+      [['Parent / Guardian', guardianText], ['Contact', guardian?.phone]],
+    ],
   });
-  const rx = M + 4 * (tw + gap);
-  doc.roundedRect(rx, y, tw, 50, 8).fill(passed ? '#16a34a' : '#dc2626');
-  doc.font('Helvetica-Bold').fontSize(6.5).fillColor('#ffffff').opacity(0.85).text('RESULT', rx, y + 9, { width: tw, align: 'center', characterSpacing: 0.7, lineBreak: false }).opacity(1);
-  doc.font('Helvetica-Bold').fontSize(15).fillColor('#ffffff').text((overall.status || '-').toUpperCase(), rx, y + 22, { width: tw, align: 'center', lineBreak: false });
-  y += 50 + 16;
+  K.avatar(doc, brand, photo, student.student_name, M + gw + 12, y, 72, gy - y);
+  y = gy + 14;
 
-  // ── scholastic ──
+  // ── scholastic areas ──
   const scholastic = subjects.filter((s) => !s.is_grade_only);
   const co = subjects.filter((s) => s.is_grade_only);
   if (scholastic.length) {
-    y = K.sectionTitle(doc, brand, 'Academic subjects', M, y, CW);
-    const rows = scholastic.map((s) => {
+    y = K.sectionTitle(doc, brand, 'Scholastic areas', M, y, CW);
+    const rows = scholastic.map((s, i) => {
       const ab = s.status === 'absent';
       const fail = !ab && Number(s.marks_obtained) < Number(s.passing_marks);
       return [
+        { text: String(i + 1), color: MUTED },
         { text: s.subject_name, bold: true },
-        { text: ab ? 'AB' : (s.marks_obtained ?? '-'), bold: true },
         { text: String(s.max_marks), color: MUTED },
+        { text: String(s.passing_marks ?? '-'), color: MUTED },
+        { text: ab ? 'AB' : (s.marks_obtained ?? '-'), bold: true, color: fail || ab ? FAIL : INK },
         { text: ab ? '-' : pct(s.marks_obtained, s.max_marks), color: MUTED },
-        { text: ab ? 'Absent' : fail ? 'Fail' : 'Pass', bold: true, color: ab || fail ? '#dc2626' : '#16a34a' },
+        { text: ab ? 'Absent' : fail ? 'Fail' : 'Pass', bold: true, color: ab || fail ? FAIL : brand.deep },
       ];
     });
-    y = K.table(doc, brand, { y, cols: [{ label: 'Subject', w: CW - 290 }, { label: 'Marks', w: 80, align: 'center' }, { label: 'Max', w: 60, align: 'center' }, { label: 'Percent', w: 70, align: 'center' }, { label: 'Result', w: 80, align: 'center' }], rows, rowH: 19 });
-    y += 14;
+    const w = [30, CW - 30 - 62 - 62 - 76 - 58 - 62, 62, 62, 76, 58, 62];
+    y = K.table(doc, brand, {
+      y, rows, rowH: 18.5,
+      cols: [{ label: 'No.', w: w[0] }, { label: 'Subject', w: w[1] }, { label: 'Max', w: w[2], align: 'center' }, { label: 'Pass', w: w[3], align: 'center' }, { label: 'Obtained', w: w[4], align: 'center' }, { label: 'Percent', w: w[5], align: 'center' }, { label: 'Result', w: w[6], align: 'center' }],
+      foot: [{ text: '' }, { text: 'GRAND TOTAL', bold: true }, { text: String(overall.max_total ?? '-'), bold: true }, { text: '' }, { text: String(overall.total_marks ?? '-'), bold: true }, { text: `${overall.percentage ?? '-'}%`, bold: true }, { text: (overall.status || '-').toUpperCase(), bold: true, color: overall.status === 'pass' ? brand.deep : FAIL }],
+    });
+    y += 13;
   }
   if (co.length) {
     y = K.sectionTitle(doc, brand, 'Co-scholastic / graded areas', M, y, CW);
-    const rows = co.map((s) => [{ text: s.subject_name, bold: true }, { text: s.status === 'absent' ? 'AB' : (s.grade_obtained || '-'), bold: true, color: gradeColor(s.grade_obtained) }]);
-    y = K.table(doc, brand, { y, cols: [{ label: 'Area', w: CW - 120 }, { label: 'Grade', w: 120, align: 'center' }], rows, rowH: 19 });
-    y += 14;
-  }
-  if (gradingScale && gradingScale.length) {
-    doc.font('Helvetica-Bold').fontSize(6.8).fillColor(FAINT).text('GRADING SCALE', M, y, { characterSpacing: 0.6, lineBreak: false });
-    doc.font('Helvetica').fontSize(7).fillColor(MUTED).text(gradingScale.map((g) => `${g.grade_label}: ${g.min_percent}-${g.max_percent}%`).join('    '), M, y + 10, { width: CW });
+    const rows = co.map((s, i) => [{ text: String(i + 1), color: MUTED }, { text: s.subject_name, bold: true }, { text: s.status === 'absent' ? 'AB' : (s.grade_obtained || '-'), bold: true, color: brand.deep }]);
+    y = K.table(doc, brand, { y, rows, rowH: 18.5, cols: [{ label: 'No.', w: 30 }, { label: 'Area', w: CW - 30 - 110 }, { label: 'Grade', w: 110, align: 'center' }] });
+    y += 13;
   }
 
-  const sy = 762, sw = (CW - 60) / 3;
-  ['Class Teacher', 'Examination In-Charge', 'Principal'].forEach((l, i) => K.signatureLine(doc, l, M + i * (sw + 30), sy, sw));
+  // ── result summary ──
+  const passed = overall.status === 'pass';
+  const cells = [['Percentage', `${overall.percentage ?? '-'}%`], ['Overall Grade', overall.grade || '-'], ['Class Rank', overall.class_rank ? `#${overall.class_rank}` : '-'], ['School Rank', overall.school_rank ? `#${overall.school_rank}` : '-'], ['Result', (overall.status || '-').toUpperCase()]];
+  const cw = CW / cells.length, sh = 40;
+  cells.forEach(([label, value], i) => {
+    const x = M + i * cw, last = i === cells.length - 1;
+    doc.rect(x, y, cw, sh).fillAndStroke(last ? (passed ? brand.color : FAIL) : brand.softer, last ? (passed ? brand.color : FAIL) : LINE);
+    doc.font('Helvetica-Bold').fontSize(6.4).fillColor(last ? (passed ? brand.on : '#ffffff') : FAINT).text(label.toUpperCase(), x, y + 7, { width: cw, align: 'center', characterSpacing: 0.7, lineBreak: false });
+    doc.font('Times-Bold').fontSize(15).fillColor(last ? (passed ? brand.on : '#ffffff') : brand.deep).text(String(value), x, y + 18, { width: cw, align: 'center', lineBreak: false });
+  });
+  doc.rect(M, y, CW, sh).lineWidth(0.9).strokeColor(brand.color).stroke();
+  y += sh + 12;
+
+  // ── grading scale ──
+  if (gradingScale && gradingScale.length) {
+    doc.font('Helvetica-Bold').fontSize(6.8).fillColor(FAINT).text('GRADING SCALE', M, y, { characterSpacing: 0.7, lineBreak: false });
+    y += 10;
+    const n = Math.min(gradingScale.length, 8), gcw = CW / n;
+    gradingScale.slice(0, n).forEach((g, i) => {
+      doc.rect(M + i * gcw, y, gcw, 20).fillAndStroke(brand.softer, LINE);
+      doc.font('Helvetica-Bold').fontSize(8).fillColor(brand.deep).text(g.grade_label, M + i * gcw, y + 3, { width: gcw, align: 'center', lineBreak: false });
+      doc.font('Helvetica').fontSize(6.3).fillColor(MUTED).text(`${g.min_percent} - ${g.max_percent}%`, M + i * gcw, y + 12, { width: gcw, align: 'center', lineBreak: false });
+    });
+    y += 20 + 12;
+  }
+
+  // ── remarks + issue date ──
+  const rh = 36, rw = CW * 0.7;
+  doc.rect(M, y, rw, rh).lineWidth(0.5).strokeColor(LINE).stroke();
+  doc.font('Helvetica').fontSize(6.4).fillColor(FAINT).text("CLASS TEACHER'S REMARKS", M + 6, y + 4.5, { characterSpacing: 0.5, lineBreak: false });
+  doc.rect(M + rw, y, CW - rw, rh).lineWidth(0.5).strokeColor(LINE).stroke();
+  doc.font('Helvetica').fontSize(6.4).fillColor(FAINT).text('DATE OF ISSUE', M + rw + 6, y + 4.5, { characterSpacing: 0.5, lineBreak: false });
+  doc.font('Helvetica-Bold').fontSize(9).fillColor(INK).text(K.fmtDate(new Date(), true), M + rw + 6, y + 15, { lineBreak: false });
+  y += rh;
+
+  // ── signatures (a new page if the content ran long) ──
+  let sy = Math.max(y + 46, H - 118);
+  if (sy > K.contentLimit(doc) - 4) { doc.addPage(); sy = 120; }
+  const sw = (CW - 50) / 3;
+  ['Class Teacher', 'Examination In-Charge', 'Principal'].forEach((l, i) => K.signatureLine(doc, l, M + i * (sw + 25), sy, sw));
 }
 
 const STUDENT_SQL = `SELECT s.first_name + ' ' + ISNULL(s.last_name,'') AS student_name, s.admission_no, s.photo_url,

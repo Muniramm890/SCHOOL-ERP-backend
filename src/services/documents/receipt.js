@@ -1,68 +1,50 @@
-// src/services/documents/receipt.js - premium fee receipt (in-memory PDF)
+// src/services/documents/receipt.js - official fee receipt. Half of A4 when it fits, full A4 when there are many fee heads.
 const { queryOne, query, sql } = require('../../config/db');
 const K = require('./kit');
-const { W, M, CW, INK, MUTED, FAINT } = K;
+const { M, CW, INK, MUTED, FAINT } = K;
 const U = (v) => ({ type: sql.UniqueIdentifier, value: v });
 
-async function drawReceipt(doc, brand, { payment, student, items, photo }) {
+// draws the receipt, returns the y where the content ends
+function drawReceipt(doc, brand, { payment, student, guardian, items }) {
+  const c = doc._compact, { width: W, height: H } = doc.page;
   const isVoid = !!payment.is_void;
-  let y = K.drawHeader(doc, brand, {
-    badge: 'Fee Receipt',
-    meta: [`No. ${payment.receipt_no}`, K.fmtDate(payment.payment_date, true), isVoid ? 'STATUS: VOID' : 'STATUS: PAID'].slice(0, 3),
-  });
+  let y = K.drawHeader(doc, brand);
+  y = K.titleBand(doc, brand, y, isVoid ? 'Fee Receipt - Cancelled' : 'Fee Receipt');
 
-  // ── two info cards ──
-  const h = 92, wl = 262, gap = 12, wr = CW - wl - gap;
-  K.card(doc, M, y, wl, h, { fill: brand.softer });
-  K.avatar(doc, brand, photo, student.student_name, M + 12, y + 12, 52, 62);
-  const sx = M + 76, sw = wl - 88;
-  doc.font('Helvetica').fontSize(6.6).fillColor(FAINT).text('RECEIVED FROM', sx, y + 12, { characterSpacing: 0.5, lineBreak: false });
-  doc.font('Helvetica-Bold').fontSize(11).fillColor(INK).text(student.student_name || '-', sx, y + 22, { width: sw, lineBreak: false, ellipsis: true });
+  const txn = payment.razorpay_payment_id || payment.transaction_ref;
   const cls = `${student.class_name || '-'}${student.section_name ? ' (' + student.section_name + ')' : ''}`;
-  doc.font('Helvetica').fontSize(8).fillColor(MUTED)
-    .text(`Class: ${cls}`, sx, y + 40, { width: sw, lineBreak: false })
-    .text(`Admission No: ${student.admission_no || '-'}`, sx, y + 52, { width: sw, lineBreak: false })
-    .text(`Roll No: ${student.roll_no || '-'}`, sx, y + 64, { width: sw, lineBreak: false });
+  y = K.infoGrid(doc, brand, {
+    y, rowH: c ? 21 : 25,
+    rows: [
+      [['Receipt No', payment.receipt_no], ['Payment Date', K.fmtDate(payment.payment_date, true)], ['Payment Mode', String(payment.payment_method || 'Cash').toUpperCase()]],
+      [['Student Name', student.student_name], ['Class & Section', cls], ['Admission No', student.admission_no]],
+      [['Parent / Guardian', guardian ? `${guardian.full_name}${guardian.relation ? ' (' + guardian.relation + ')' : ''}` : '-'], ['Roll No', student.roll_no], ['Transaction / Ref', txn || payment.bank_name || '-']],
+    ],
+  }) + (c ? 9 : 14);
 
-  const rx = M + wl + gap;
-  K.card(doc, rx, y, wr, h);
-  const cw2 = (wr - 36) / 2, txn = payment.razorpay_payment_id || payment.transaction_ref;
-  K.kv(doc, 'Receipt No', payment.receipt_no, rx + 14, y + 12, cw2);
-  K.kv(doc, 'Payment Date', K.fmtDate(payment.payment_date), rx + 22 + cw2, y + 12, cw2);
-  K.kv(doc, 'Payment Mode', String(payment.payment_method || 'Cash').toUpperCase(), rx + 14, y + 38, cw2);
-  K.kv(doc, 'Transaction / Ref', txn || payment.bank_name || '-', rx + 22 + cw2, y + 38, cw2);
-  if (txn && payment.bank_name) K.kv(doc, 'Bank / Gateway', payment.bank_name, rx + 14, y + 66, wr - 28, { size: 8 });
-  y += h + 18;
-
-  // ── fee table ──
-  y = K.sectionTitle(doc, brand, 'Fee details', M, y, CW);
   const rows = (items && items.length ? items : [{ category_name: 'Fee Payment', amount_paise: payment.amount_paise }]).map((it, i) => [
     { text: String(i + 1), color: MUTED },
-    it.discount_paise > 0
-      ? { text: it.category_name, bold: true, sub: `Includes discount of ${K.money(it.discount_paise / 100)}`, subColor: '#dc2626' }
-      : { text: it.category_name, bold: true },
+    it.discount_paise > 0 ? { text: it.category_name, bold: true, sub: `Includes discount of ${K.money(it.discount_paise / 100)}`, subColor: '#b91c1c' } : { text: it.category_name, bold: true },
     { text: K.money(it.amount_paise / 100), bold: true },
   ]);
-  y = K.table(doc, brand, { y, cols: [{ label: '#', w: 36 }, { label: 'Description', w: CW - 36 - 130 }, { label: 'Amount', w: 130, align: 'right' }], rows, rowH: 21 });
-  y += 14;
+  y = K.table(doc, brand, {
+    y, rowH: c ? 16 : 20, headH: c ? 17 : 20, rows,
+    cols: [{ label: 'S.No', w: 40 }, { label: 'Particulars', w: CW - 40 - 130 }, { label: 'Amount', w: 130, align: 'right' }],
+    foot: [{ text: '' }, { text: isVoid ? 'AMOUNT (CANCELLED)' : 'TOTAL AMOUNT PAID', bold: true }, { text: K.money(payment.amount_paise / 100), bold: true, color: isVoid ? '#b91c1c' : brand.deep }],
+  });
 
-  // ── total + words ──
-  const tw = 214;
-  K.card(doc, W - M - tw, y, tw, 52, { fill: brand.soft, stroke: brand.color });
-  doc.font('Helvetica-Bold').fontSize(7).fillColor(MUTED).text(isVoid ? 'AMOUNT (CANCELLED)' : 'TOTAL AMOUNT PAID', W - M - tw, y + 10, { width: tw, align: 'center', characterSpacing: 0.8, lineBreak: false });
-  doc.font('Helvetica-Bold').fontSize(18).fillColor(isVoid ? '#dc2626' : brand.deep).text(K.money(payment.amount_paise / 100), W - M - tw, y + 24, { width: tw, align: 'center', lineBreak: false });
-  const lw = CW - tw - 16;
-  doc.font('Helvetica').fontSize(6.6).fillColor(FAINT).text('AMOUNT IN WORDS', M, y + 4, { characterSpacing: 0.5, lineBreak: false });
-  doc.font('Helvetica-Oblique').fontSize(8.5).fillColor(INK).text(K.amountInWords(payment.amount_paise / 100), M, y + 15, { width: lw });
-  if (payment.remarks) doc.font('Helvetica').fontSize(7.5).fillColor(MUTED).text(`Remarks: ${payment.remarks}`, M, doc.y + 6, { width: lw });
-  y += 52 + 48;
+  y += 7;
+  doc.font('Helvetica').fontSize(7.4).fillColor(FAINT).text('AMOUNT IN WORDS:', M, y, { continued: true, characterSpacing: 0.3 });
+  doc.font('Times-Italic').fontSize(9.5).fillColor(INK).text(`  ${K.amountInWords(payment.amount_paise / 100)}`, { characterSpacing: 0 });
+  if (payment.remarks) { doc.font('Helvetica').fontSize(7.8).fillColor(MUTED).text(`Remarks: ${payment.remarks}`, M, doc.y + 2, { width: CW }); }
+  y = doc.y + (c ? 10 : 22);
 
-  // ── signatures ──
-  doc.font('Helvetica').fontSize(8).fillColor(MUTED).text('Collected by', M, y - 34, { lineBreak: false });
-  doc.font('Helvetica-Bold').fontSize(9).fillColor(INK).text(payment.collected_by_name || 'Online Payment System', M, y - 23, { lineBreak: false });
-  K.signatureLine(doc, 'Authorised Signatory', W - M - 150, y, 150);
-
+  const sy = c ? y + 17 : Math.max(y + 30, H - 150);
+  doc.font('Helvetica').fontSize(7.5).fillColor(FAINT).text('COLLECTED BY', M, sy - 22, { characterSpacing: 0.5, lineBreak: false });
+  doc.font('Helvetica-Bold').fontSize(9).fillColor(INK).text(payment.collected_by_name || 'Online Payment System', M, sy - 12, { lineBreak: false });
+  K.signatureLine(doc, 'Authorised Signatory', W - M - 150, sy, 150);
   if (isVoid) K.stamp(doc, 'VOID');
+  return sy + 14;
 }
 
 async function receiptPdf(schoolId, paymentId, { studentId } = {}) {
@@ -75,10 +57,10 @@ async function receiptPdf(schoolId, paymentId, { studentId } = {}) {
   if (!payment) throw K.httpError(404, 'Payment not found');
   if (studentId && String(payment.student_id).toLowerCase() !== String(studentId).toLowerCase()) throw K.httpError(403, 'Not allowed');
 
-  const [brand, student, itemsRes] = await Promise.all([
+  const [brand, student, guardian, itemsRes] = await Promise.all([
     K.getBrand(schoolId),
     queryOne(
-      `SELECT s.first_name + ' ' + ISNULL(s.last_name,'') AS student_name, s.admission_no, s.photo_url,
+      `SELECT s.first_name + ' ' + ISNULL(s.last_name,'') AS student_name, s.admission_no,
               g.name AS class_name, sc.name AS section_name, e.roll_no
        FROM students s
        LEFT JOIN enrolments e ON e.student_id = s.id AND e.school_id=@sid AND e.is_active=1
@@ -87,6 +69,7 @@ async function receiptPdf(schoolId, paymentId, { studentId } = {}) {
        WHERE s.id=@uid AND s.school_id=@sid`,
       { uid: U(payment.student_id), sid: U(schoolId) }
     ),
+    queryOne(`SELECT TOP 1 relation, full_name FROM student_guardians WHERE student_id=@uid AND is_primary=1 AND deleted_at IS NULL`, { uid: U(payment.student_id) }),
     query(
       `SELECT fc.name AS category_name, fpi.amount_paise, fpi.discount_paise
        FROM fee_payment_items fpi JOIN fee_categories fc ON fc.id = fpi.fee_category_id
@@ -95,11 +78,14 @@ async function receiptPdf(schoolId, paymentId, { studentId } = {}) {
     ),
   ]);
   if (!student) throw K.httpError(404, 'Student not found');
-  const photo = await K.fetchImage(student.photo_url);
+  const data = { payment, student, guardian, items: itemsRes.recordset || [] };
+  const title = `Fee Receipt ${payment.receipt_no}`;
 
-  const doc = K.createDoc(brand, { title: `Fee Receipt ${payment.receipt_no}` });
-  await drawReceipt(doc, brand, { payment, student, items: itemsRes.recordset || [], photo });
-  K.drawFooters(doc, brand, { ref: payment.receipt_no, pageNumbers: false });
+  // try half page first; if the content does not fit above the footer, use a full A4 page
+  let doc = K.createDoc(brand, { title, half: true });
+  let end = drawReceipt(doc, brand, data);
+  if (end > K.contentLimit(doc) || doc.bufferedPageRange().count > 1) { doc = K.createDoc(brand, { title, half: false }); drawReceipt(doc, brand, data); }
+  K.drawFooters(doc, brand, { ref: payment.receipt_no });
   return { buffer: await K.finish(doc), filename: `Receipt_${payment.receipt_no}` };
 }
 
