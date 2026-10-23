@@ -8,12 +8,24 @@ const W = 595.28, H = 841.89, M = 36, CW = W - M * 2;
 const INK = '#0f172a', MUTED = '#64748b', FAINT = '#94a3b8', LINE = '#e2e8f0';
 
 // ── colour helpers ──────────────────────────────────────────────
-const hex = (c, f = '#E8600A') => (c && /^#?[0-9A-Fa-f]{6}$/.test(c) ? (c.startsWith('#') ? c : `#${c}`) : f);
+// School brand colour (setup module -> schools.brand_color). Accepts #RGB / #RRGGBB, falls back to the app default.
+const DEFAULT_BRAND = '#E8600A';
+const hex = (c, f = DEFAULT_BRAND) => {
+  let v = String(c || '').trim().replace(/^#/, '');
+  if (/^[0-9a-fA-F]{3}$/.test(v)) v = v.split('').map((x) => x + x).join('');
+  return /^[0-9a-fA-F]{6}$/.test(v) ? `#${v.toLowerCase()}` : f;
+};
+const lum = (h) => { // WCAG relative luminance
+  const n = parseInt(h.slice(1), 16);
+  const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
 const mix = (h, t) => { // blend colour with white: t=0 original ... t=1 white
   const n = parseInt(h.slice(1), 16);
   const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => Math.round(v * (1 - t) + 255 * t));
   return '#' + c.map((v) => v.toString(16).padStart(2, '0')).join('');
 };
+const darkenTo = (h, maxLum) => { let c = h, i = 0; while (lum(c) > maxLum && i++ < 12) { const n = parseInt(c.slice(1), 16); c = '#' + [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => Math.round(v * 0.88).toString(16).padStart(2, '0')).join(''); } return c; };
 const darken = (h, t) => {
   const n = parseInt(h.slice(1), 16);
   const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => Math.round(v * (1 - t)));
@@ -81,7 +93,9 @@ async function getBrand(schoolId) {
     fetchImage(s.watermark_url || s.logo_url, { cache: true }),
   ]);
   return {
-    ...s, color, soft: mix(color, 0.9), softer: mix(color, 0.95), deep: darken(color, 0.35), logo, watermark,
+    ...s, color, soft: mix(color, 0.9), softer: mix(color, 0.95), deep: darkenTo(darken(color, 0.35), 0.1), logo, watermark,
+    on: lum(color) > 0.5 ? '#0f172a' : '#ffffff',   // readable text colour on top of the brand colour
+    text: darkenTo(color, 0.22),                      // brand colour that stays readable as text on white
     address: [s.address_line1, s.address_line2, s.city, s.state, s.pincode].filter(Boolean).join(', '),
     contact: [s.phone && `Ph: ${s.phone}`, s.email, s.website].filter(Boolean).join('   |   '),
   };
@@ -128,7 +142,7 @@ function drawHeader(doc, brand, { badge, meta = [] }) {
     try { doc.image(brand.logo, M + 5, top + 5, { fit: [box - 10, box - 10], align: 'center', valign: 'center' }); } catch { /* skip */ }
   } else {
     doc.roundedRect(M, top, box, box, 10).fill(brand.soft);
-    doc.fillColor(brand.color).font('Helvetica-Bold').fontSize(22).text((brand.name || 'S')[0].toUpperCase(), M, top + 14, { width: box, align: 'center', lineBreak: false });
+    doc.fillColor(brand.text).font('Helvetica-Bold').fontSize(22).text((brand.name || 'S')[0].toUpperCase(), M, top + 14, { width: box, align: 'center', lineBreak: false });
   }
 
   const tx = M + box + 12, tw = 268;
@@ -137,7 +151,7 @@ function drawHeader(doc, brand, { badge, meta = [] }) {
   while (doc.fontSize(fs).widthOfString(name) > tw - 6 && fs > 8) fs -= 0.5;
   doc.fillColor(INK).fontSize(fs).text(name, tx, top + 1, { width: tw, lineBreak: false });
   let y = top + fs + 5;
-  if (brand.tagline) { doc.font('Helvetica-Oblique').fontSize(7.5).fillColor(brand.color).text(brand.tagline, tx, y, { width: tw, lineBreak: false }); y += 10; }
+  if (brand.tagline) { doc.font('Helvetica-Oblique').fontSize(7.5).fillColor(brand.text).text(brand.tagline, tx, y, { width: tw, lineBreak: false }); y += 10; }
   if (brand.address) { doc.font('Helvetica').fontSize(7).fillColor(MUTED).text(brand.address, tx, y, { width: tw }); y = doc.y + 1.5; }
   if (brand.contact) { doc.font('Helvetica').fontSize(7).fillColor(MUTED).text(brand.contact, tx, y, { width: tw, lineBreak: false }); y += 9; }
   if (brand.affiliation_board || brand.affiliation_no) {
@@ -149,7 +163,7 @@ function drawHeader(doc, brand, { badge, meta = [] }) {
   const label = (badge || '').toUpperCase();
   const pw = Math.min(190, doc.widthOfString(label, { characterSpacing: 1 }) + 28);
   doc.roundedRect(W - M - pw, top + 2, pw, 20, 10).fill(brand.color);
-  doc.fillColor('#ffffff').text(label, W - M - pw, top + 8, { width: pw, align: 'center', characterSpacing: 1, lineBreak: false });
+  doc.fillColor(brand.on).text(label, W - M - pw, top + 8, { width: pw, align: 'center', characterSpacing: 1, lineBreak: false });
   let my = top + 30;
   meta.slice(0, 3).forEach((m, i) => {
     doc.font(i === 0 ? 'Helvetica-Bold' : 'Helvetica').fontSize(i === 0 ? 9 : 7.5).fillColor(i === 0 ? INK : MUTED)
@@ -176,7 +190,7 @@ function drawFooters(doc, brand, { ref = '', pageNumbers = true, note = 'This is
     doc.text(note, M + 120, y + 6, { width: CW - 240, align: 'center', lineBreak: false });
     const right = [ref, pageNumbers ? `Page ${i + 1} of ${r.count}` : ''].filter(Boolean).join('   -   ');
     doc.text(right, W - M - 200, y + 6, { width: 200, align: 'right', lineBreak: false });
-    doc.font('Helvetica-Bold').fontSize(7).fillColor(brand.color)
+    doc.font('Helvetica-Bold').fontSize(7).fillColor(brand.text)
       .text(`${brand.name || ''}${brand.website ? '  -  ' + brand.website : ''}`, M, y + 18, { width: CW, align: 'center', lineBreak: false });
     doc.rect(0, H - 5, W, 5).fill(brand.color);
   }
@@ -184,7 +198,7 @@ function drawFooters(doc, brand, { ref = '', pageNumbers = true, note = 'This is
 
 // ── building blocks ─────────────────────────────────────────────
 function sectionTitle(doc, brand, text, x, y, w) {
-  doc.font('Helvetica-Bold').fontSize(7.5).fillColor(brand.color).text(text.toUpperCase(), x, y, { width: w, characterSpacing: 0.9, lineBreak: false });
+  doc.font('Helvetica-Bold').fontSize(7.5).fillColor(brand.text).text(text.toUpperCase(), x, y, { width: w, characterSpacing: 0.9, lineBreak: false });
   const tw = doc.widthOfString(text.toUpperCase(), { characterSpacing: 0.9 });
   doc.moveTo(x + tw + 8, y + 4).lineTo(x + w, y + 4).lineWidth(0.6).strokeColor(LINE).stroke();
   return y + 15;
@@ -211,7 +225,7 @@ function avatar(doc, brand, buf, name, x, y, w, h) {
       doc.restore(); ok = true;
     } catch { doc.restore(); }
   }
-  if (!ok) doc.fillColor(brand.color).font('Helvetica-Bold').fontSize(Math.min(w, h) * 0.42).text((name || '?')[0].toUpperCase(), x, y + h / 2 - Math.min(w, h) * 0.27, { width: w, align: 'center', lineBreak: false });
+  if (!ok) doc.fillColor(brand.text).font('Helvetica-Bold').fontSize(Math.min(w, h) * 0.42).text((name || '?')[0].toUpperCase(), x, y + h / 2 - Math.min(w, h) * 0.27, { width: w, align: 'center', lineBreak: false });
   doc.roundedRect(x, y, w, h, 8).lineWidth(1).strokeColor(brand.color).stroke();
 }
 
@@ -221,7 +235,7 @@ function table(doc, brand, { x = M, y, cols, rows, rowH = 19, headH = 20, onPage
   const head = (yy) => {
     doc.roundedRect(x, yy, w, headH, 5).fill(brand.color);
     let cx = x;
-    doc.font('Helvetica-Bold').fontSize(7.5).fillColor('#ffffff');
+    doc.font('Helvetica-Bold').fontSize(7.5).fillColor(brand.on);
     cols.forEach((c) => { doc.text(c.label.toUpperCase(), cx + 8, yy + 6.5, { width: c.w - 16, align: c.align || 'left', characterSpacing: 0.6, lineBreak: false }); cx += c.w; });
     return yy + headH;
   };
@@ -270,7 +284,7 @@ function sendPdf(res, buffer, filename) {
 
 module.exports = {
   W, H, M, CW, INK, MUTED, FAINT, LINE,
-  hex, mix, darken, money, moneyShort, fmtDate, nowIst, safeName, amountInWords, httpError,
+  hex, lum, mix, darken, darkenTo, DEFAULT_BRAND, money, moneyShort, fmtDate, nowIst, safeName, amountInWords, httpError,
   fetchImage, getBrand, createDoc, finish, drawHeader, drawFooters,
   sectionTitle, card, kv, avatar, table, signatureLine, stamp, sendPdf,
 };

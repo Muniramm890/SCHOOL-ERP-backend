@@ -30,9 +30,9 @@ function drawPayslip(doc, brand, slip) {
   if (!ded.length) ded.push(['No deductions', 0]);
 
   const gap = 14, cw = (CW - gap) / 2, rowH = 19;
-  const side = (x, title, list, totalLabel, total, tone) => {
+  const side = (x, title, list, totalLabel, total, tone, onTone) => {
     doc.roundedRect(x, y, cw, 20, 5).fill(tone);
-    doc.font('Helvetica-Bold').fontSize(7.5).fillColor('#ffffff').text(title.toUpperCase(), x + 10, y + 6.5, { characterSpacing: 0.8, lineBreak: false });
+    doc.font('Helvetica-Bold').fontSize(7.5).fillColor(onTone).text(title.toUpperCase(), x + 10, y + 6.5, { characterSpacing: 0.8, lineBreak: false });
     doc.text('AMOUNT', x, y + 6.5, { width: cw - 10, align: 'right', characterSpacing: 0.8, lineBreak: false });
     let yy = y + 20;
     list.forEach(([label, v], i) => {
@@ -48,8 +48,8 @@ function drawPayslip(doc, brand, slip) {
       doc.text(K.money(total), x, fy + 7, { width: cw - 10, align: 'right', lineBreak: false });
     } };
   };
-  const L = side(M, 'Earnings', earn, 'Gross Earnings', slip.gross_salary, brand.color);
-  const R = side(M + cw + gap, 'Deductions', ded, 'Total Deductions', slip.total_deduction, '#475569');
+  const L = side(M, 'Earnings', earn, 'Gross Earnings', slip.gross_salary, brand.color, brand.on);
+  const R = side(M + cw + gap, 'Deductions', ded, 'Total Deductions', slip.total_deduction, '#475569', '#ffffff');
   const fy = Math.max(L.yy, R.yy);
   L.draw(fy); R.draw(fy);
   y = fy + 22 + 18;
