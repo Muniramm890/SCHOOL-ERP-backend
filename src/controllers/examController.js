@@ -499,7 +499,10 @@ exports.saveGradingScale = handle(async (req, res) => {
   }
   if (errors.length) throw bad(errors[0], errors);
   bands.sort((a, b) => b.min_percent - a.min_percent);
-  bands.forEach((b, i) => { b.sort_order = i; });
+  bands.forEach((b, i) => {
+    b.sort_order = i;
+    b.max_percent = i === 0 ? 100 : R.round2(bands[i - 1].min_percent - 0.01); // no overlap: 70-79.99, 80-89.99, 90-100
+  });
 
   await withTransaction(async (tx) => {
     const r = tx.request();

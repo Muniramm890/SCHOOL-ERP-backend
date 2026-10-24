@@ -107,15 +107,14 @@ async function computeSection(schoolId, exam, sectionId) {
                 FROM OPENJSON(@j) WITH (student_id uniqueidentifier '$.student_id', total_marks decimal(8,2) '$.total_marks', max_total decimal(8,2) '$.max_total',
                                         pct decimal(5,2) '$.pct', grade varchar(10) '$.grade', status varchar(20) '$.status')`);
     }
-    // ranks: class_rank = within the section, school_rank = within the whole class (all sections of the grade). incomplete = no rank.
+    // ranks: class_rank = within the section, school_rank = across every student of the exam (whole school). incomplete = no rank.
     await rq(`UPDATE er SET class_rank = x.rk
               FROM exam_results er JOIN (SELECT id, RANK() OVER (PARTITION BY section_id ORDER BY percentage DESC) AS rk
                                          FROM exam_results WHERE exam_group_id=@eid AND school_id=@sid AND status<>'incomplete') x ON x.id = er.id
               WHERE er.exam_group_id=@eid AND er.section_id=@sec`);
     await rq(`UPDATE er SET school_rank = x.rk
-              FROM exam_results er JOIN (SELECT r.id, RANK() OVER (PARTITION BY sc.grade_id ORDER BY r.percentage DESC) AS rk
-                                         FROM exam_results r JOIN sections sc ON sc.id = r.section_id
-                                         WHERE r.exam_group_id=@eid AND r.school_id=@sid AND r.status<>'incomplete') x ON x.id = er.id
+              FROM exam_results er JOIN (SELECT id, RANK() OVER (ORDER BY percentage DESC) AS rk
+                                         FROM exam_results WHERE exam_group_id=@eid AND school_id=@sid AND status<>'incomplete') x ON x.id = er.id
               WHERE er.exam_group_id=@eid AND er.school_id=@sid`);
     await rq(`UPDATE exam_results SET class_rank=NULL, school_rank=NULL WHERE exam_group_id=@eid AND school_id=@sid AND status='incomplete'`);
   });
