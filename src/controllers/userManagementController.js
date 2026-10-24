@@ -338,7 +338,7 @@ exports.updateRole = async (req, res, next) => {
 // usermanagement + auditlogs yaha nahi — wo sirf school_admin ke liye hain.
 const VALID_MODULES = [
   'dashboard', 'attendance', 'homework', 'tests', 'timetable', 'arrangement', 'exams', 'results',
-  'leaderboard', 'analytics', 'students', 'commhub', 'teachers', 'fees', 'payroll', 'transport',
+  'students', 'commhub', 'teachers', 'fees', 'payroll', 'transport',
   'promotion', 'setup',
 ];
 

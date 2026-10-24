@@ -157,23 +157,54 @@ exports.getOverview = handle(async (req, res) => {
   const { schoolId } = req.user;
   const egId = needExamParam(req);
   const p = { egId: U(egId), sid: U(schoolId) };
-  const [stats, topper] = await Promise.all([
+  const done = `er.exam_group_id=@egId AND er.school_id=@sid AND er.status <> 'incomplete'`;
+  const [stats, top, bandR, histR, trendR] = await Promise.all([
     query(`SELECT COUNT(*) AS total_appeared, ${PASS} AS total_pass, ${FAIL} AS total_fail,
                   SUM(CASE WHEN er.status='incomplete' THEN 1 ELSE 0 END) AS total_incomplete,
                   ${AVG} AS avg_percentage, MAX(CASE WHEN er.status <> 'incomplete' THEN er.percentage END) AS highest_percentage
            FROM exam_results er ${EXAM_JOIN} WHERE er.exam_group_id=@egId AND er.school_id=@sid`, p),
-    query(`SELECT TOP 1 er.student_id, (s.first_name + ' ' + ISNULL(s.last_name,'')) AS full_name, er.percentage, g.name AS grade_name, sec.name AS section_name
+    query(`SELECT TOP 3 er.student_id, (s.first_name + ' ' + ISNULL(s.last_name,'')) AS full_name, s.photo_url, er.percentage, er.grade,
+                  g.name AS grade_name, sec.name AS section_name
            FROM exam_results er ${EXAM_JOIN}
            JOIN students s ON s.id = er.student_id JOIN sections sec ON sec.id = er.section_id JOIN grades g ON g.id = sec.grade_id
            WHERE er.exam_group_id=@egId AND er.school_id=@sid AND er.status='pass'
            ORDER BY er.percentage DESC, er.total_marks DESC`, p),
+    query(`SELECT SUM(CASE WHEN er.percentage >= 90 THEN 1 ELSE 0 END) AS b1,
+                  SUM(CASE WHEN er.percentage >= 75 AND er.percentage < 90 THEN 1 ELSE 0 END) AS b2,
+                  SUM(CASE WHEN er.percentage >= 60 AND er.percentage < 75 THEN 1 ELSE 0 END) AS b3,
+                  SUM(CASE WHEN er.percentage >= 45 AND er.percentage < 60 THEN 1 ELSE 0 END) AS b4,
+                  SUM(CASE WHEN er.percentage < 45 THEN 1 ELSE 0 END) AS b5
+           FROM exam_results er ${EXAM_JOIN} WHERE ${done}`, p),
+    query(`SELECT CASE WHEN er.percentage >= 100 THEN 9 ELSE CAST(FLOOR(er.percentage / 10) AS INT) END AS bucket, COUNT(*) AS n
+           FROM exam_results er ${EXAM_JOIN} WHERE ${done} GROUP BY CASE WHEN er.percentage >= 100 THEN 9 ELSE CAST(FLOOR(er.percentage / 10) AS INT) END`, p),
+    // class/school average of every exam of the same academic year that has results (for the trend chart)
+    query(`SELECT eg.id AS exam_group_id, eg.name AS exam_name, eg.start_date, COUNT(*) AS appeared,
+                  ${AVG} AS avg_percentage, ${PASS} AS pass_count, ${FAIL} AS fail_count
+           FROM exam_results er ${EXAM_JOIN}
+           WHERE er.school_id=@sid AND er.status <> 'incomplete'
+             AND eg.academic_year_id = (SELECT academic_year_id FROM exam_groups WHERE id=@egId AND school_id=@sid)
+           GROUP BY eg.id, eg.name, eg.start_date ORDER BY eg.start_date`, p),
   ]);
   const s = stats.recordset[0];
+  const b = bandR.recordset[0] || {};
+  const bands = [
+    { key: 'outstanding', label: 'Outstanding (90-100%)', count: b.b1 || 0 },
+    { key: 'excellent', label: 'Excellent (75-89%)', count: b.b2 || 0 },
+    { key: 'good', label: 'Good (60-74%)', count: b.b3 || 0 },
+    { key: 'average', label: 'Average (45-59%)', count: b.b4 || 0 },
+    { key: 'below', label: 'Below Average (<45%)', count: b.b5 || 0 },
+  ];
+  const hist = Array.from({ length: 10 }, (_, i) => ({ range: i === 9 ? '90-100' : `${i * 10}-${i * 10 + 9}`, count: 0 }));
+  histR.recordset.forEach((r) => { if (r.bucket >= 0 && r.bucket <= 9) hist[r.bucket].count = r.n; });
+  const trend = trendR.recordset.slice(-8).map((t) => ({
+    exam_group_id: t.exam_group_id, exam_name: t.exam_name, start_date: t.start_date, appeared: t.appeared,
+    avg_percentage: pct2(t.avg_percentage), pass_percent: ratio(t.pass_count, t.pass_count + t.fail_count),
+  }));
   return success(res, {
     total_appeared: s.total_appeared || 0, total_pass: s.total_pass || 0, total_fail: s.total_fail || 0, total_incomplete: s.total_incomplete || 0,
     pass_percent: ratio(s.total_pass || 0, (s.total_pass || 0) + (s.total_fail || 0)),
     avg_percentage: pct2(s.avg_percentage), highest_percentage: s.highest_percentage,
-    topper: topper.recordset[0] || null,
+    topper: top.recordset[0] || null, toppers: top.recordset, bands, histogram: hist, trend,
   }, 'Overview fetched');
 });
 
@@ -190,10 +221,10 @@ exports.getClassWise = handle(async (req, res) => {
 exports.getSectionWise = handle(async (req, res) => {
   const egId = needExamParam(req);
   const r = await query(`
-    SELECT sec.id AS section_id, sec.name AS section_name, g.name AS grade_name, COUNT(*) AS total_students, ${PASS} AS pass_count, ${FAIL} AS fail_count, ${AVG} AS avg_percentage
+    SELECT sec.id AS section_id, sec.name AS section_name, g.id AS grade_id, g.name AS grade_name, COUNT(*) AS total_students, ${PASS} AS pass_count, ${FAIL} AS fail_count, ${AVG} AS avg_percentage
     FROM exam_results er ${EXAM_JOIN} JOIN sections sec ON sec.id = er.section_id JOIN grades g ON g.id = sec.grade_id
     WHERE er.exam_group_id=@egId AND er.school_id=@sid
-    GROUP BY sec.id, sec.name, g.name, g.numeric_order ORDER BY g.numeric_order, sec.name`, { egId: U(egId), sid: U(req.user.schoolId) });
+    GROUP BY sec.id, sec.name, g.id, g.name, g.numeric_order ORDER BY g.numeric_order, sec.name`, { egId: U(egId), sid: U(req.user.schoolId) });
   return success(res, r.recordset.map((x) => ({ ...x, avg_percentage: pct2(x.avg_percentage), pass_percent: ratio(x.pass_count, x.pass_count + x.fail_count) })), 'Section-wise analysis fetched');
 });
 
@@ -266,18 +297,19 @@ exports.getTeacherWise = handle(async (req, res) => {
 
 exports.getToppers = handle(async (req, res) => {
   const egId = needExamParam(req);
-  const { grade_id, limit } = req.query;
+  const { grade_id, section_id, limit } = req.query;
   if (grade_id) R.needUuid(grade_id, 'grade_id');
+  if (section_id) R.needUuid(section_id, 'section_id');
   const top = Math.min(Math.max(Number(limit) || 10, 1), 50);
   const r = await query(`
-    SELECT TOP (@top) er.student_id, (s.first_name + ' ' + ISNULL(s.last_name,'')) AS student_name, er.percentage, er.grade, er.class_rank, er.school_rank,
+    SELECT TOP (@top) er.student_id, (s.first_name + ' ' + ISNULL(s.last_name,'')) AS student_name, s.photo_url, er.percentage, er.grade, er.total_marks, er.max_total, er.class_rank, er.school_rank,
            g.name AS grade_name, sec.name AS section_name, enr.roll_no
     FROM exam_results er ${EXAM_JOIN}
     JOIN students s ON s.id = er.student_id JOIN sections sec ON sec.id = er.section_id JOIN grades g ON g.id = sec.grade_id
     LEFT JOIN enrolments enr ON enr.student_id = er.student_id AND enr.section_id = er.section_id AND enr.academic_year_id = eg.academic_year_id AND enr.is_active=1 AND enr.deleted_at IS NULL
-    WHERE er.exam_group_id=@egId AND er.school_id=@sid AND er.status='pass' AND (@gradeId IS NULL OR g.id=@gradeId)
+    WHERE er.exam_group_id=@egId AND er.school_id=@sid AND er.status='pass' AND (@gradeId IS NULL OR g.id=@gradeId) AND (@secId IS NULL OR er.section_id=@secId)
     ORDER BY er.percentage DESC, er.total_marks DESC`,
-    { top: { type: sql.Int, value: top }, gradeId: U(grade_id || null), egId: U(egId), sid: U(req.user.schoolId) });
+    { top: { type: sql.Int, value: top }, gradeId: U(grade_id || null), secId: U(section_id || null), egId: U(egId), sid: U(req.user.schoolId) });
   return success(res, r.recordset, 'Toppers fetched');
 });
 
