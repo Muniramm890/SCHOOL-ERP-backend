@@ -33,6 +33,71 @@ exports.listStaff = async (req, res, next) => {
 };
 
 
+
+// ── GET /api/admin/users/staff/:memberId ───────────────────────────────────
+// One staff account for the detail page (+ transport / bus-tracking info when this person is a driver)
+exports.getStaffDetail = async (req, res, next) => {
+  try {
+    const { schoolId } = req.user;
+    const row = await queryOne(
+      `SELECT sm.id AS member_id, sm.user_id, sm.role, sm.is_active, sm.employee_code, sm.join_date, sm.permissions,
+              u.full_name, u.email, u.phone, u.avatar_url, u.gender, u.date_of_birth, u.address, u.last_login_at, u.created_at AS account_created_at,
+              sp.department, sp.designation
+       FROM school_members sm
+       JOIN users u ON u.id = sm.user_id
+       LEFT JOIN staff_profiles sp ON sp.user_id = sm.user_id AND sp.school_id = sm.school_id AND sp.deleted_at IS NULL
+       WHERE sm.id = @mid AND sm.school_id = @sid AND sm.deleted_at IS NULL`,
+      { mid: { type: sql.UniqueIdentifier, value: req.params.memberId }, sid: { type: sql.UniqueIdentifier, value: schoolId } });
+    if (!row) return notFound(res, 'Staff member not found');
+
+    let transport = null;
+    try {
+      const ts = await queryOne(`SELECT TOP 1 id, role, status, license_no FROM transport_staff WHERE user_id=@u AND school_id=@s AND deleted_at IS NULL ORDER BY created_at DESC`,
+        { u: { type: sql.UniqueIdentifier, value: row.user_id }, s: { type: sql.UniqueIdentifier, value: schoolId } });
+      if (ts) {
+        const tracker = require('../services/trackerService');
+        const d = await tracker.resolveDriver(row.user_id, schoolId, { fresh: true });
+        let device = null;
+        try {
+          device = await queryOne(`SELECT TOP 1 last_seen_at, battery_pct, app_version, device_model FROM transport_tracker_tokens WHERE user_id=@u AND school_id=@s AND revoked_at IS NULL ORDER BY created_at DESC`,
+            { u: { type: sql.UniqueIdentifier, value: row.user_id }, s: { type: sql.UniqueIdentifier, value: schoolId } });
+        } catch { /* tracker table not created yet */ }
+        transport = { staff_id: ts.id, role: ts.role, status: ts.status, license_no: ts.license_no, vehicle: d.vehicle, route: d.route, tracker: device };
+      }
+    } catch { /* transport tables optional */ }
+
+    return success(res, {
+      ...row,
+      permissions: (() => { try { return JSON.parse(row.permissions || '{}'); } catch { return {}; } })(),
+      is_self: row.user_id === req.user.userId,
+      transport,
+    });
+  } catch (err) { next(err); }
+};
+
+// ── GET /api/admin/users/students/:studentId ───────────────────────────────
+// One student + login status for the detail page (no sensitive fields like Aadhaar / caste)
+exports.getStudentDetail = async (req, res, next) => {
+  try {
+    const { schoolId } = req.user;
+    const r = await queryOne(
+      `SELECT st.id AS student_id, st.first_name, st.middle_name, st.last_name, st.photo_url, st.admission_no, st.gender, st.date_of_birth, st.admission_date,
+              g.name AS class_name, sec.name AS section_name, e.roll_no,
+              sg.full_name AS guardian_name, sg.relation AS guardian_relation, sg.phone AS guardian_phone,
+              sc.id AS credential_id, sc.is_active AS login_active, sc.identifier_type, sc.login_identifier, sc.login_phone, sc.login_email, sc.last_login_at, sc.created_at AS login_created_at
+       FROM students st
+       LEFT JOIN enrolments e ON e.student_id=st.id AND e.school_id=@sid AND e.is_active=1 AND e.deleted_at IS NULL
+       LEFT JOIN sections sec ON sec.id=e.section_id
+       LEFT JOIN grades g ON g.id=sec.grade_id
+       LEFT JOIN student_guardians sg ON sg.student_id=st.id AND sg.is_primary=1 AND sg.deleted_at IS NULL
+       LEFT JOIN student_credentials sc ON sc.student_id=st.id AND sc.deleted_at IS NULL
+       WHERE st.id=@stid AND st.school_id=@sid AND st.deleted_at IS NULL`,
+      { stid: { type: sql.UniqueIdentifier, value: req.params.studentId }, sid: { type: sql.UniqueIdentifier, value: schoolId } });
+    if (!r) return notFound(res, 'Student not found');
+    return success(res, { ...r, login_status: !r.credential_id ? 'not_authorized' : r.login_active ? 'active' : 'blocked' });
+  } catch (err) { next(err); }
+};
+
 // ── GET /api/admin/users/students-overview ──────────────────────────────
 exports.getStudentsOverview = async (req, res, next) => {
   try {

@@ -7,6 +7,7 @@ router.use(authenticate);
 router.use(authorize()); // no args → sirf 'school_admin' (Super Admin) pass hoga
 
 router.get('/staff', ctrl.listStaff);
+router.get('/staff/:memberId', ctrl.getStaffDetail);
 router.get('/students-overview', ctrl.getStudentsOverview);
 
 router.put('/:memberId/status', ctrl.updateStatus);
@@ -16,6 +17,7 @@ router.post('/:memberId/reset-password', ctrl.resetPassword);
 router.put('/:memberId/email', ctrl.updateEmail);
 
 router.get('/students', ctrl.listStudentsForAuth);
+router.get('/students/:studentId', ctrl.getStudentDetail);
 router.post('/students/:studentId/authorize', ctrl.authorizeStudent);
 router.put('/students/:studentId/status', ctrl.updateStudentLoginStatus);
 router.post('/students/:studentId/reset-password', ctrl.resetStudentPassword);
