@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const { query, queryOne, sql } = require('../config/db');
 const { success, badRequest, unauthorized } = require('../utils/response');
 const { logAudit } = require('../utils/auditLogger');
+const sessions = require('../services/sessionService');
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 // Hardcode the secret for testing right now
@@ -31,6 +32,7 @@ exports.login = async (req, res, next) => {
     });
 
     if (!user) {
+      sessions.recordFailure({ req, type: 'staff', identifier: email, reason: 'user_not_found' });
       await logAudit({
         actionType: 'LOGIN_FAILED',
         userName: email,
@@ -40,10 +42,11 @@ exports.login = async (req, res, next) => {
       });
       return unauthorized(res, 'Invalid email or password');
     }
-    if (!user.is_active) return unauthorized(res, 'Your account is inactive. Please contact support.');
+    if (!user.is_active) { sessions.recordFailure({ req, type: 'staff', identifier: email, reason: 'inactive' }); return unauthorized(res, 'Your account is inactive. Please contact support.'); }
 
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) {
+      sessions.recordFailure({ req, type: 'staff', identifier: email, reason: 'wrong_password' });
       await logAudit({
         userId: user.id,
         actionType: 'LOGIN_FAILED',
@@ -70,7 +73,13 @@ exports.login = async (req, res, next) => {
       userId: { type: sql.UniqueIdentifier, value: user.id } 
     });
 
-    const payload = { userId: user.id, schoolId: memberData.school_id, role: memberData.role, fullName: user.full_name };
+    // login session: device / IP / place, needed for "who is logged in" and remote logout. Never blocks the login if it fails.
+    let sid = null;
+    try {
+      sid = await sessions.createSession({ req, schoolId: memberData.school_id, type: 'staff', userId: user.id, name: user.full_name, role: memberData.role, ttlMs: 30 * 86400000 });
+    } catch (e) { console.error('[sessions] create failed (login continues):', e.message); }
+
+    const payload = { userId: user.id, schoolId: memberData.school_id, role: memberData.role, fullName: user.full_name, ...(sid ? { sid } : {}) };
     const token = signToken(payload);
     const refreshToken = signRefresh(payload);
 
@@ -88,6 +97,7 @@ exports.login = async (req, res, next) => {
      return success(res, {
       token,
       refreshToken,
+      sessionId: sid,
       userId: user.id,
       name: user.full_name,
       role: memberData.role,
@@ -212,6 +222,8 @@ exports.changePassword = async (req, res, next) => {
       hash: { type: sql.NVarChar(255), value: newHash }, 
       userId: { type: sql.UniqueIdentifier, value: req.user.userId } 
     });
+    // password changed -> every OTHER device is logged out
+    await sessions.revokeAllFor({ type: 'staff', userId: req.user.userId, exceptSid: req.sid || null, reason: 'password_changed' }).catch(() => {});
 
     return success(res, null, 'Password updated successfully');
   } catch (err) { next(err); }
@@ -227,7 +239,10 @@ exports.refresh = async (req, res, next) => {
     // An access token must never be able to renew itself forever. (Refresh tokens issued before this change have no `type`
     // and keep working until they expire.)
     if (decoded.type === 'access') return unauthorized(res, 'Invalid refresh token');
-    const token = signToken({ userId: decoded.userId, schoolId: decoded.schoolId, role: decoded.role, fullName: decoded.fullName });
+    // session must still be alive (checked in the DB, not the cache): remote logout / logout / password change stop the refresh too
+    if (decoded.sid && !(await sessions.check(decoded.sid, { fresh: true }))) return unauthorized(res, 'Session ended. Please log in again.');
+    if (decoded.sid) sessions.touch(decoded.sid, true);
+    const token = signToken({ userId: decoded.userId, schoolId: decoded.schoolId, role: decoded.role, fullName: decoded.fullName, ...(decoded.sid ? { sid: decoded.sid } : {}) });
     
     return success(res, { token });
   } catch (err) {
@@ -238,6 +253,7 @@ exports.refresh = async (req, res, next) => {
 };
 
 exports.logout = async (req, res) => {
+   if (req.sid) await sessions.endSession(req.sid, 'logout');
    await logAudit({
     schoolId: req.user?.schoolId,
     userId: req.user?.userId,

@@ -34,4 +34,9 @@ router.get('/me',               authenticate, ctrl.me);
 router.put('/me',                authenticate, ctrl.updateProfile);
 router.post('/change-password', authenticate, ctrl.changePassword);
 
+// My devices (where am I logged in) + log out another device
+const security = require('../controllers/securityController');
+router.get('/sessions', authenticate, security.mineStaff.list);
+router.post('/sessions/:id/revoke', authenticate, security.mineStaff.revoke);
+
 module.exports = router;

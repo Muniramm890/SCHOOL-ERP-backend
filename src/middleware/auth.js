@@ -2,6 +2,7 @@
 const jwt = require('jsonwebtoken');
 const { unauthorized, forbidden } = require('../utils/response');
 const { queryOne, sql } = require('../config/db');
+const sessions = require('../services/sessionService');
 
 // Verify JWT and attach user context
 const authenticate = async (req, res, next) => {
@@ -21,6 +22,12 @@ const secretKey = process.env.JWT_SECRET;
 const decoded = jwt.verify(token, secretKey);
     // Only real access tokens: refresh tokens (30 days) and password-reset tokens are signed with the same secret.
     if (decoded.type === 'refresh' || decoded.purpose) return unauthorized(res, 'Invalid token type');
+    // Login session (remote logout / logout / password change end it). Old tokens without `sid` keep working until they expire.
+    if (decoded.sid) {
+      if (!(await sessions.check(decoded.sid))) return unauthorized(res, 'Session ended. Please log in again.');
+      req.sid = decoded.sid;
+      sessions.touch(decoded.sid);
+    }
     // Fetch live user + school member record
     const member = await queryOne(
       `SELECT sm.id AS member_id, sm.school_id, sm.user_id, sm.role, sm.permissions, sm.is_active,

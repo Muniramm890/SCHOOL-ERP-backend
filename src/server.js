@@ -124,6 +124,7 @@ app.use(`${API}/comm`,          moduleGate('commhub',  { 'GET /messages/:id': 'o
 app.use(`${API}/homework`,      moduleGate('homework', { 'GET /mine': 'skip' }),           require('./routes/homework'));
 app.use('/api/attendance',      moduleGate('attendance', { 'GET /staff/roster': ['attendance', 'dashboard'] }), require('./routes/attendance'));
 app.use(`${API}/audit`, require('./routes/audit'));
+app.use(`${API}/security`, require('./routes/security')); // login activity + remote logout (school admin)
 app.use(`${API}/admin/users`, require('./routes/userManagement'));
 app.use(`${API}/transport`,     moduleGate('transport'),                                   require('./routes/transport'));
 

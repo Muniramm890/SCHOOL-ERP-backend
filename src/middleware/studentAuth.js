@@ -2,6 +2,7 @@
 const jwt = require('jsonwebtoken');
 const { unauthorized } = require('../utils/response');
 const { queryOne, sql } = require('../config/db');
+const sessions = require('../services/sessionService');
 
 const secretKey = process.env.JWT_SECRET;
 
@@ -17,6 +18,11 @@ const authenticateStudent = async (req, res, next) => {
     
     if (decoded.type !== 'student') {
         return unauthorized(res, 'Invalid token type');
+    }
+    if (decoded.sid) {
+        if (!(await sessions.check(decoded.sid))) return unauthorized(res, 'Session ended. Please log in again.');
+        req.sid = decoded.sid;
+        sessions.touch(decoded.sid);
     }
 
     const row = await queryOne(

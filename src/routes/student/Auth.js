@@ -15,4 +15,9 @@ router.put('/me', authenticateStudent, ctrl.updateProfile);
 router.post('/change-password', authenticateStudent, ctrl.changePassword);
 router.post('/logout', authenticateStudent, ctrl.logout);
 
+// My devices + log out another device
+const security = require('../../controllers/securityController');
+router.get('/sessions', authenticateStudent, security.mineStudent.list);
+router.post('/sessions/:id/revoke', authenticateStudent, security.mineStudent.revoke);
+
 module.exports = router;

@@ -2,6 +2,7 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { query, queryOne, sql } = require('../config/db');
+const sessions = require('../services/sessionService');
 const { success, badRequest, notFound } = require('../utils/response');
 // ⚠️ Aapke signupController.js mein jo WhatsApp OTP sender use ho raha hai wahi yahan import karo
 // const { sendWhatsappOtp } = require('../services/whatsappService');
@@ -76,6 +77,7 @@ exports.resetPassword = async (req, res, next) => {
       hash: { type: sql.NVarChar(255), value: hash },
       ph: { type: sql.VarChar(20), value: decoded.phone },
     });
+    await sessions.revokeStudentsByPhone(decoded.phone).catch(() => {});
     return success(res, null, 'Password reset successfully');
   } catch (err) {
     if (err.name === 'TokenExpiredError' || err.name === 'JsonWebTokenError') return badRequest(res, 'Reset session expired or invalid, please request OTP again');

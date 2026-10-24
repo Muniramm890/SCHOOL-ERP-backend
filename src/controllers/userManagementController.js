@@ -1,6 +1,7 @@
 // src/controllers/userManagementController.js
 const bcrypt = require('bcryptjs');
 const { query, queryOne, sql } = require('../config/db');
+const sessions = require('../services/sessionService');
 const { success, badRequest, notFound } = require('../utils/response');
 const { logAudit } = require('../utils/auditLogger');
 
@@ -234,6 +235,7 @@ exports.resetStudentPassword = async (req, res, next) => {
       `UPDATE student_credentials SET password_hash=@hash, updated_at=GETUTCDATE() WHERE id=@id`,
       { hash: { type: sql.NVarChar(255), value: hash }, id: { type: sql.UniqueIdentifier, value: cred.id } }
     );
+    await sessions.revokeStudentByCredentialId(cred.id).catch(() => {});
 
     await logAudit({
       schoolId, userId: actingUserId, userName: actingUserName, userRole: req.user.role,
@@ -404,6 +406,7 @@ exports.resetPassword = async (req, res, next) => {
       `UPDATE users SET password=@pw, updated_at=GETUTCDATE() WHERE id=@uid`,
       { pw: { type: sql.NVarChar(255), value: hash }, uid: { type: sql.UniqueIdentifier, value: target.user_id } }
     );
+    await sessions.revokeAllFor({ type: 'staff', userId: target.user_id, reason: 'password_changed' }).catch(() => {});
 
     await logAudit({
       schoolId, userId: actingUserId, userName: actingUserName, userRole: req.user.role,

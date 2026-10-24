@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { query, queryOne, sql } = require('../config/db');
 const { success, badRequest, unauthorized } = require('../utils/response');
+const sessions = require('../services/sessionService');
 
 const secret = process.env.JWT_SECRET;
 const signToken = (payload) => jwt.sign(payload, secret, { expiresIn: '24h' });
@@ -24,17 +25,21 @@ exports.login = async (req, res, next) => {
 
     
 
-    if (!cred) return unauthorized(res, 'Invalid credentials');
-    if (!cred.is_active) return unauthorized(res, 'Your account has been blocked. Contact school office.');
+    if (!cred) { sessions.recordFailure({ req, type: 'student', identifier, reason: 'user_not_found' }); return unauthorized(res, 'Invalid credentials'); }
+    if (!cred.is_active) { sessions.recordFailure({ req, schoolId: cred.school_id, type: 'student', identifier, reason: 'inactive' }); return unauthorized(res, 'Your account has been blocked. Contact school office.'); }
 
     const valid = await bcrypt.compare(password, cred.password_hash);
-    if (!valid) return unauthorized(res, 'Invalid credentials');
+    if (!valid) { sessions.recordFailure({ req, schoolId: cred.school_id, type: 'student', identifier, reason: 'wrong_password' }); return unauthorized(res, 'Invalid credentials'); }
 
     await query(`UPDATE student_credentials SET last_login_at=GETUTCDATE() WHERE id=@id`, {
       id: { type: sql.UniqueIdentifier, value: cred.id },
     });
 
-    const token = signToken({ studentId: cred.student_id, schoolId: cred.school_id, type: 'student' });
+    let sid = null; // login session (device / IP / place + remote logout); never blocks the login
+    try {
+      sid = await sessions.createSession({ req, schoolId: cred.school_id, type: 'student', studentId: cred.student_id, name: `${cred.first_name} ${cred.last_name || ''}`.trim(), role: 'student', ttlMs: 24 * 3600000 });
+    } catch (e) { console.error('[sessions] create failed (login continues):', e.message); }
+    const token = signToken({ studentId: cred.student_id, schoolId: cred.school_id, type: 'student', ...(sid ? { sid } : {}) });
 
     await query(
       `INSERT INTO audit_logs (id, school_id, student_id, actor_type, action_type, user_name, created_at)
@@ -48,6 +53,7 @@ exports.login = async (req, res, next) => {
 
     return success(res, {
       token,
+      sessionId: sid,
       studentId: cred.student_id,
       name: `${cred.first_name} ${cred.last_name || ''}`.trim(),
     });
@@ -106,12 +112,14 @@ exports.changePassword = async (req, res, next) => {
       hash: { type: sql.NVarChar(255), value: newHash },
       id: { type: sql.UniqueIdentifier, value: cred.id },
     });
+    await sessions.revokeAllFor({ type: 'student', studentId, exceptSid: req.sid || null, reason: 'password_changed' }).catch(() => {});
     return success(res, null, 'Password updated successfully');
   } catch (err) { next(err); }
 };
 
 // ── POST /api/student/auth/logout ───────────────────────────────────────────
 exports.logout = async (req, res) => {
+  if (req.sid) await sessions.endSession(req.sid, 'logout');
   await query(
     `INSERT INTO audit_logs (id, school_id, student_id, actor_type, action_type, created_at)
      VALUES (NEWID(), @sid, @stid, 'student', 'LOGOUT', GETUTCDATE())`,

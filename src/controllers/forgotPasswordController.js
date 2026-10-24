@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const sql = require('mssql');
 const { query, queryOne } = require('../config/db');
+const sessions = require('../services/sessionService');
 const { sendWhatsAppOtp } = require('../utils/whatsapp');
 const { sendHtmlEmail } = require('../services/emailService');
 const { logAudit } = require('../utils/auditLogger');
@@ -161,6 +162,7 @@ exports.resetPassword = async (req, res, next) => {
       userId: { type: sql.UniqueIdentifier, value: decoded.userId }
     });
 
+    await sessions.revokeAllFor({ type: 'staff', userId: decoded.userId, reason: 'password_changed' }).catch(() => {});
     await logAudit({
       userId: decoded.userId,
       actionType: 'PASSWORD_RESET_VIA_OTP',
